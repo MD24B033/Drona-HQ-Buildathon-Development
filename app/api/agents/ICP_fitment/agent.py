@@ -1,24 +1,30 @@
+"""ICP Fitment Agent.
+
+Scores prospects belonging to a campaign's target companies against one
+ICP and writes the verdicts to `prospect_icp_matches`.
+"""
+
 import asyncio
 import json
-import os
+from datetime import datetime, timezone
 from typing import Any
 
-from google import genai
-from google.genai import types
-
+from core.config import (
+    ICP_FITMENT_BATCH_SIZE,
+    ICP_FITMENT_CONCURRENCY,
+    ICP_FITMENT_MAX_RETRIES,
+    ICP_FITMENT_RETRY_DELAY,
+    model_for,
+)
+from core.gemini import clamp_score, generate_json, is_permanent_error
 from db.supabase_client import supabase
 
-
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
 
 SYSTEM_PROMPT = """
 You are an ICP Fitment Agent for a B2B sales automation system.
 
-Your job is to determine how well a prospect matches an Ideal Customer Profile (ICP).
-
-You are evaluating an individual prospect against the provided ICP.
+Your job is to determine how well a prospect matches an Ideal Customer
+Profile (ICP).
 
 Evaluate ONLY information explicitly provided in:
 
@@ -29,9 +35,7 @@ Evaluate ONLY information explicitly provided in:
 5. The prospect's company context, when provided
 
 Do not invent facts about the prospect or company.
-
 Do not assume information that is missing.
-
 Do not use outside knowledge.
 
 You must return structured JSON with exactly these fields:
@@ -44,168 +48,47 @@ You must return structured JSON with exactly these fields:
   "evidence": {}
 }
 
-Field rules:
+match_score: 0-100, how strongly the prospect matches the ICP.
+confidence: 0-100, how confident you are given the available evidence.
+decision: exactly one of qualified, disqualified, needs_review.
+reasoning: a concise explanation of the score and decision.
+evidence: an object of concrete evidence drawn from the supplied data.
 
-match_score:
-A number from 0 to 100 representing how strongly
-the prospect matches the ICP.
+Scoring:
 
-confidence:
-A number from 0 to 100 representing how confident
-you are in the assessment based on the available evidence.
+90-100  Very strong match; the most important criteria are clearly met.
+70-89   Strong match; most important criteria met, minor uncertainty.
+50-69   Partial match; meaningful information missing or conflicting.
+0-49    Poor match; strong evidence of a mismatch.
 
-decision:
-Must be exactly one of:
+Decisions:
 
-qualified
-disqualified
-needs_review
-
-reasoning:
-A concise explanation of why the prospect received
-the score and decision.
-
-evidence:
-An object containing concrete evidence from the supplied
-prospect and ICP data.
-
-Scoring principles:
-
-90-100:
-Very strong ICP match.
-
-The most important ICP criteria are clearly satisfied
-with strong evidence.
-
-70-89:
-Strong ICP match.
-
-Most important criteria appear satisfied, but there
-may be minor uncertainty or missing information.
-
-50-69:
-Potential or partial match.
-
-There is some supporting evidence, but meaningful
-information is missing, ambiguous, or conflicting.
-
-0-49:
-Poor match.
-
-There is strong evidence that the prospect does not
-match important ICP criteria.
-
-Decision rules:
-
-qualified:
-Use when there is strong evidence that the prospect
-matches the important ICP criteria.
-
-disqualified:
-Use when there is strong evidence that the prospect
-does not match important ICP criteria.
-
-needs_review:
-Use when important information is missing, ambiguous,
-contradictory, or insufficient to confidently qualify
-or disqualify the prospect.
+qualified      Strong evidence the prospect matches the important criteria.
+disqualified   Strong evidence the prospect does not match them.
+needs_review   Information is missing, ambiguous or contradictory.
 
 Important rules:
 
-- Never invent company size.
-- Never invent industry.
-- Never invent revenue.
-- Never invent technology usage.
-- Never invent geography.
-- Never invent responsibilities.
-- Never invent seniority.
-- Never invent company characteristics.
-- Never invent prospect characteristics.
-- Never infer a fact that is not reasonably supported by
-  the supplied data.
-- Missing information is NOT automatically negative evidence.
-- Missing information should generally reduce confidence.
-- Evaluate the actual ICP criteria rather than generic
-  assumptions about the prospect.
+- Never invent company size, industry, revenue, technology usage,
+  geography, responsibilities, seniority, or any other characteristic.
+- Missing information is NOT negative evidence; it reduces confidence.
+- Evaluate the actual ICP criteria, not generic assumptions.
 - Evidence must come from the supplied data.
-- Keep reasoning concise and factual.
 - Return JSON only.
 """
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+DECISIONS = {"qualified", "disqualified", "needs_review"}
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY is not configured"
-    )
-
-
-MODEL = os.getenv(
-    "ICP_FITMENT_MODEL",
-    "gemini-3.6-flash",
-).strip()
-
-
-MAX_CONCURRENCY = int(
-    os.getenv(
-        "ICP_FITMENT_CONCURRENCY",
-        "10",
-    )
-)
-
-
-BATCH_SIZE = int(
-    os.getenv(
-        "ICP_FITMENT_BATCH_SIZE",
-        "100",
-    )
-)
-
-
-MAX_RETRIES = int(
-    os.getenv(
-        "ICP_FITMENT_MAX_RETRIES",
-        "3",
-    )
-)
-
-
-RETRY_BASE_DELAY = float(
-    os.getenv(
-        "ICP_FITMENT_RETRY_DELAY",
-        "1",
-    )
-)
-
-
-# ============================================================
-# GEMINI CLIENT
-# ============================================================
-
-gemini = genai.Client(
-    api_key=GEMINI_API_KEY,
-)
-
-print(
-    f"[ICP FITMENT] Gemini model: {MODEL}"
-)
-
-
-# ============================================================
-# ICP FITMENT AGENT
-# ============================================================
 
 class ICPFitmentAgent:
 
-    def __init__(self):
-        self.semaphore = asyncio.Semaphore(
-            MAX_CONCURRENCY
-        )
+    agent_type = "icp_fitment"
+
+    def __init__(self, system_prompt: str | None = None):
+        self.model = model_for("icp_fitment")
+        self.system_prompt = system_prompt or SYSTEM_PROMPT
+        self.semaphore = asyncio.Semaphore(ICP_FITMENT_CONCURRENCY)
 
     # ========================================================
     # MAIN PIPELINE
@@ -214,113 +97,74 @@ class ICPFitmentAgent:
     async def run(
         self,
         icp_id: str,
+        company_ids: list[str] | None = None,
+        prospect_ids: list[str] | None = None,
     ) -> dict[str, Any]:
+        """Evaluate prospects against one ICP.
 
-        """
-        Run ICP fitment for every prospect belonging
-        to the companies selected for the ICP's campaign.
+        ICP -> campaign -> campaign_companies -> prospects -> Gemini
+        -> prospect_icp_matches.
 
-        Flow:
-
-            ICP
-             ↓
-            Campaign
-             ↓
-            Campaign Companies
-             ↓
-            Company IDs
-             ↓
-            Prospects
-             ↓
-            Gemini evaluation
-             ↓
-            Batch upsert
-             ↓
-            Metrics
+        `company_ids` narrows the campaign's companies; `prospect_ids`
+        restricts the run to specific people.
         """
 
-        # ----------------------------------------------------
-        # 1. Get ICP
-        # ----------------------------------------------------
-
-        icp = await asyncio.to_thread(
-            self.get_icp,
-            icp_id,
-        )
+        icp = await asyncio.to_thread(self.get_icp, icp_id)
 
         if not icp:
-            raise ValueError(
-                f"ICP {icp_id} not found."
-            )
+            raise ValueError(f"ICP {icp_id} not found.")
 
-        campaign_id = icp.get(
-            "campaign_id"
-        )
+        campaign_id = icp.get("campaign_id")
 
         if not campaign_id:
             raise ValueError(
                 f"ICP {icp_id} is not associated with a campaign."
             )
 
-        # ----------------------------------------------------
-        # 2. Get companies selected for campaign
-        # ----------------------------------------------------
-
-        company_ids = await asyncio.to_thread(
+        campaign_company_ids = await asyncio.to_thread(
             self.get_campaign_company_ids,
             campaign_id,
         )
 
-        if not company_ids:
-            return {
-                "icp_id": icp_id,
-                "campaign_id": campaign_id,
-                "company_ids": [],
-                "total_companies": 0,
-                "total_prospects": 0,
-                "processed": 0,
-                "failed": 0,
-                "qualified": 0,
-                "disqualified": 0,
-                "needs_review": 0,
-            }
+        if company_ids:
+            requested = set(company_ids)
 
-        # ----------------------------------------------------
-        # 3. Get prospects belonging to selected companies
-        # ----------------------------------------------------
+            selected_company_ids = [
+                company_id
+                for company_id in campaign_company_ids
+                if company_id in requested
+            ]
+        else:
+            selected_company_ids = campaign_company_ids
+
+        empty_summary = {
+            "icp_id": icp_id,
+            "campaign_id": campaign_id,
+            "company_ids": selected_company_ids,
+            "total_companies": len(selected_company_ids),
+            "total_prospects": 0,
+            "processed": 0,
+            "failed": 0,
+            "qualified": 0,
+            "disqualified": 0,
+            "needs_review": 0,
+        }
+
+        if not selected_company_ids:
+            return empty_summary
 
         prospects = await asyncio.to_thread(
             self.get_prospects,
-            company_ids,
+            selected_company_ids,
+            prospect_ids,
         )
 
-        total_prospects = len(
-            prospects
-        )
+        total_prospects = len(prospects)
 
         if total_prospects == 0:
-            return {
-                "icp_id": icp_id,
-                "campaign_id": campaign_id,
-                "company_ids": company_ids,
-                "total_companies": len(
-                    company_ids
-                ),
-                "total_prospects": 0,
-                "processed": 0,
-                "failed": 0,
-                "qualified": 0,
-                "disqualified": 0,
-                "needs_review": 0,
-            }
+            return empty_summary
 
-        # ----------------------------------------------------
-        # 4. Process prospects in batches
-        # ----------------------------------------------------
-
-        all_results: list[
-            dict[str, Any]
-        ] = []
+        all_results: list[dict[str, Any]] = []
 
         processed = 0
         failed = 0
@@ -328,212 +172,189 @@ class ICPFitmentAgent:
         for batch_start in range(
             0,
             total_prospects,
-            BATCH_SIZE,
+            ICP_FITMENT_BATCH_SIZE,
         ):
 
             batch = prospects[
-                batch_start:
-                batch_start + BATCH_SIZE
+                batch_start:batch_start + ICP_FITMENT_BATCH_SIZE
             ]
 
-            batch_end = min(
-                batch_start + BATCH_SIZE,
-                total_prospects,
-            )
-
             print(
-                "[ICP FITMENT] "
-                f"Processing prospects "
-                f"{batch_start + 1}-{batch_end} "
+                "[ICP FITMENT] Processing prospects "
+                f"{batch_start + 1}-{batch_start + len(batch)} "
                 f"of {total_prospects}"
             )
 
-            # ------------------------------------------------
-            # Run Gemini evaluations concurrently
-            # ------------------------------------------------
-
-            tasks = [
-                self.evaluate_prospect(
-                    prospect=prospect,
-                    icp=icp,
-                )
-                for prospect in batch
-            ]
-
             batch_results = await asyncio.gather(
-                *tasks,
+                *[
+                    self.evaluate_prospect(prospect=prospect, icp=icp)
+                    for prospect in batch
+                ],
                 return_exceptions=True,
             )
 
-            valid_results: list[
-                dict[str, Any]
-            ] = []
+            valid_results: list[dict[str, Any]] = []
 
             for result in batch_results:
 
-                if isinstance(
-                    result,
-                    Exception,
-                ):
+                if isinstance(result, Exception) or result is None:
                     failed += 1
 
-                    print(
-                        "[ICP FITMENT] "
-                        "Unexpected evaluation error:",
-                        result,
-                    )
+                    if isinstance(result, Exception):
+                        print(
+                            "[ICP FITMENT] Unexpected evaluation error:",
+                            result,
+                        )
 
                     continue
 
-                if result is None:
-                    failed += 1
-                    continue
-
-                valid_results.append(
-                    result
-                )
+                valid_results.append(result)
 
                 if result["status"] == "failed":
                     failed += 1
                 else:
                     processed += 1
 
-            # ------------------------------------------------
-            # Save batch immediately
-            # ------------------------------------------------
-
             if valid_results:
+                await asyncio.to_thread(self.save_results, valid_results)
 
-                await asyncio.to_thread(
-                    self.save_results,
-                    valid_results,
-                )
-
-                all_results.extend(
-                    valid_results
-                )
+                all_results.extend(valid_results)
 
             print(
-                "[ICP FITMENT] "
-                f"Batch complete | "
-                f"processed={processed} | "
-                f"failed={failed}"
+                "[ICP FITMENT] Batch complete | "
+                f"processed={processed} | failed={failed}"
             )
-
-        # ----------------------------------------------------
-        # 5. Final summary
-        # ----------------------------------------------------
 
         return self.build_summary(
             icp_id=icp_id,
             campaign_id=campaign_id,
-            company_ids=company_ids,
+            company_ids=selected_company_ids,
             results=all_results,
             total=total_prospects,
             failed=failed,
         )
 
+    async def evaluate_one(
+        self,
+        prospect_id: str,
+        icp_id: str,
+    ) -> dict[str, Any]:
+        """Score a single prospect. Used by the discovery agent."""
+
+        icp = await asyncio.to_thread(self.get_icp, icp_id)
+
+        if not icp:
+            raise ValueError(f"ICP {icp_id} not found.")
+
+        prospect = await asyncio.to_thread(
+            self.get_prospect,
+            prospect_id,
+        )
+
+        if not prospect:
+            raise ValueError(f"Prospect {prospect_id} not found.")
+
+        result = await self.evaluate_prospect(prospect=prospect, icp=icp)
+
+        await asyncio.to_thread(self.save_results, [result])
+
+        return result
+
     # ========================================================
-    # GET ICP
+    # DATA ACCESS
     # ========================================================
 
-    def get_icp(
-        self,
-        icp_id: str,
-    ) -> dict | None:
+    PROSPECT_SELECT = """
+        id,
+        company_id,
+        full_name,
+        current_title,
+        linkedin_url,
+        country,
+        city,
+        functional_area,
+        areas_of_expertise,
+        context,
+        companies (
+            id,
+            name,
+            website,
+            industry,
+            employee_count,
+            country,
+            city,
+            description,
+            context
+        )
+    """
+
+    def get_icp(self, icp_id: str) -> dict | None:
 
         response = (
             supabase
             .table("icps")
-            .select(
-                """
-                id,
-                campaign_id,
-                name,
-                description,
-                criteria
-                """
-            )
-            .eq(
-                "id",
-                icp_id,
-            )
-            .single()
+            .select("id, campaign_id, name, description, criteria")
+            .eq("id", icp_id)
+            .maybe_single()
             .execute()
         )
 
-        return response.data
+        return response.data if response else None
 
-    # ========================================================
-    # GET CAMPAIGN COMPANIES
-    # ========================================================
-
-    def get_campaign_company_ids(
-        self,
-        campaign_id: str,
-    ) -> list[str]:
+    def get_campaign_company_ids(self, campaign_id: str) -> list[str]:
 
         response = (
             supabase
             .table("campaign_companies")
-            .select(
-                "company_id"
-            )
-            .eq(
-                "campaign_id",
-                campaign_id,
-            )
+            .select("company_id")
+            .eq("campaign_id", campaign_id)
             .execute()
         )
 
-        rows = response.data or []
-
         return [
             row["company_id"]
-            for row in rows
+            for row in (response.data or [])
             if row.get("company_id")
         ]
 
-    # ========================================================
-    # GET PROSPECTS
-    # ========================================================
+    def get_prospect(self, prospect_id: str) -> dict | None:
+
+        response = (
+            supabase
+            .table("prospects")
+            .select(self.PROSPECT_SELECT)
+            .eq("id", prospect_id)
+            .maybe_single()
+            .execute()
+        )
+
+        return response.data if response else None
 
     def get_prospects(
         self,
         company_ids: list[str],
+        prospect_ids: list[str] | None = None,
     ) -> list[dict]:
 
         if not company_ids:
             return []
 
-        response = (
+        query = (
             supabase
             .table("prospects")
-            .select(
-                """
-                id,
-                company_id,
-                full_name,
-                current_title,
-                linkedin_url,
-                country,
-                city,
-                functional_area,
-                areas_of_expertise,
-                context
-                """
-            )
-            .in_(
-                "company_id",
-                company_ids,
-            )
-            .execute()
+            .select(self.PROSPECT_SELECT)
+            .in_("company_id", company_ids)
         )
+
+        if prospect_ids:
+            query = query.in_("id", prospect_ids)
+
+        response = query.execute()
 
         return response.data or []
 
     # ========================================================
-    # EVALUATE ONE PROSPECT
+    # EVALUATION
     # ========================================================
 
     async def evaluate_prospect(
@@ -544,185 +365,87 @@ class ICPFitmentAgent:
 
         async with self.semaphore:
 
-            prompt = self.build_prompt(
-                prospect=prospect,
-                icp=icp,
-            )
+            prompt = self.build_prompt(prospect=prospect, icp=icp)
 
-            for attempt in range(
-                MAX_RETRIES + 1
-            ):
+            try:
+                result = await generate_json(
+                    model=self.model,
+                    prompt=prompt,
+                    system_instruction=self.system_prompt,
+                    max_retries=ICP_FITMENT_MAX_RETRIES,
+                    retry_delay=ICP_FITMENT_RETRY_DELAY,
+                )
 
-                try:
+                return self.normalize_result(
+                    result=result,
+                    prospect=prospect,
+                    icp=icp,
+                )
 
-                    response = await asyncio.to_thread(
-                        gemini.models.generate_content,
-                        model=MODEL,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_PROMPT,
-                            response_mime_type="application/json",
-                        ),
-                    )
+            except Exception as exc:
+                print(
+                    "[ICP FITMENT] Failed prospect "
+                    f"{prospect.get('id')}: {exc}"
+                )
 
-                    if not response.text:
-                        raise ValueError(
-                            "Gemini returned an empty response."
-                        )
-
-                    result = json.loads(
-                        response.text
-                    )
-
-                    return self.normalize_result(
-                        result=result,
-                        prospect=prospect,
-                        icp=icp,
-                    )
-
-                except Exception as exc:
-
-                    error_text = str(exc)
-
-                    # ----------------------------------------
-                    # Permanent errors should NOT be retried
-                    # ----------------------------------------
-
-                    permanent_error = (
-                        "404" in error_text
-                        or "NOT_FOUND" in error_text
-                        or "invalid model" in error_text.lower()
-                        or "model is not found" in error_text.lower()
-                        or "permission denied" in error_text.lower()
-                        or "api key" in error_text.lower()
-                    )
-
-                    is_last_attempt = (
-                        attempt >= MAX_RETRIES
-                    )
-
-                    if permanent_error or is_last_attempt:
-
-                        print(
-                            "[ICP FITMENT] "
-                            f"Failed prospect "
-                            f"{prospect.get('id')}: "
-                            f"{error_text}"
-                        )
-
-                        return self.build_failed_result(
-                            prospect=prospect,
-                            icp=icp,
-                            error=error_text,
-                        )
-
-                    delay = (
-                        RETRY_BASE_DELAY
-                        * (
-                            2 ** attempt
-                        )
-                    )
-
+                if is_permanent_error(exc):
                     print(
-                        "[ICP FITMENT] "
-                        f"Request failed for "
-                        f"{prospect.get('id')}. "
-                        f"Retry {attempt + 1}/"
-                        f"{MAX_RETRIES} "
-                        f"in {delay:.1f}s"
+                        "[ICP FITMENT] Permanent error - check "
+                        "GEMINI_API_KEY and the configured model name."
                     )
 
-                    await asyncio.sleep(
-                        delay
-                    )
+                return self.build_failed_result(
+                    prospect=prospect,
+                    icp=icp,
+                    error=str(exc),
+                )
 
-        return self.build_failed_result(
-            prospect=prospect,
-            icp=icp,
-            error="Unknown evaluation error.",
-        )
+    def build_prompt(self, prospect: dict, icp: dict) -> str:
 
-    # ========================================================
-    # BUILD PROMPT
-    # ========================================================
-
-    def build_prompt(
-        self,
-        prospect: dict,
-        icp: dict,
-    ) -> str:
+        company = prospect.get("companies") or {}
 
         prospect_data = {
-            "full_name": prospect.get(
-                "full_name"
-            ),
-            "current_title": prospect.get(
-                "current_title"
-            ),
-            "linkedin_url": prospect.get(
-                "linkedin_url"
-            ),
-            "country": prospect.get(
-                "country"
-            ),
-            "city": prospect.get(
-                "city"
-            ),
-            "functional_area": prospect.get(
-                "functional_area"
-            ),
-            "areas_of_expertise": (
-                prospect.get(
-                    "areas_of_expertise"
-                )
-                or []
-            ),
-            "context": (
-                prospect.get(
-                    "context"
-                )
-                or {}
-            ),
+            "full_name": prospect.get("full_name"),
+            "current_title": prospect.get("current_title"),
+            "linkedin_url": prospect.get("linkedin_url"),
+            "country": prospect.get("country"),
+            "city": prospect.get("city"),
+            "functional_area": prospect.get("functional_area"),
+            "areas_of_expertise": prospect.get("areas_of_expertise") or [],
+            "context": prospect.get("context") or {},
         }
 
         icp_data = {
-            "name": icp.get(
-                "name"
-            ),
-            "description": icp.get(
-                "description"
-            ),
-            "criteria": (
-                icp.get(
-                    "criteria"
-                )
-                or {}
-            ),
+            "name": icp.get("name"),
+            "description": icp.get("description"),
+            "criteria": icp.get("criteria") or {},
         }
 
+        icp_json = json.dumps(icp_data, indent=2, default=str)
+        prospect_json = json.dumps(prospect_data, indent=2, default=str)
+        company_json = json.dumps(company, indent=2, default=str)
+
         return f"""
-Evaluate the following prospect against
-the provided Ideal Customer Profile.
+Evaluate the following prospect against the provided Ideal Customer
+Profile.
 
 ========================
 IDEAL CUSTOMER PROFILE
 ========================
 
-{json.dumps(
-    icp_data,
-    indent=2,
-    default=str,
-)}
+{icp_json}
 
 ========================
 PROSPECT
 ========================
 
-{json.dumps(
-    prospect_data,
-    indent=2,
-    default=str,
-)}
+{prospect_json}
+
+========================
+PROSPECT'S COMPANY
+========================
+
+{company_json}
 
 ========================
 EVALUATION
@@ -732,30 +455,21 @@ Determine:
 
 1. match_score from 0 to 100
 2. confidence from 0 to 100
-3. decision
+3. decision (qualified, disqualified or needs_review)
 4. concise reasoning
 5. concrete evidence
-
-Decision must be exactly one of:
-
-qualified
-disqualified
-needs_review
 
 Rules:
 
 - Do not invent information.
 - Do not assume missing information.
-- Missing information should reduce confidence.
-- Missing information should NOT automatically result
-  in disqualification.
+- Missing information reduces confidence but does not disqualify.
 - Evaluate against the actual ICP criteria.
-- Use only evidence contained in the supplied data.
 - Return JSON only.
 """
 
     # ========================================================
-    # NORMALIZE GEMINI RESULT
+    # RESULT SHAPING
     # ========================================================
 
     def normalize_result(
@@ -765,58 +479,29 @@ Rules:
         icp: dict,
     ) -> dict[str, Any]:
 
-        match_score = self.clamp(
-            result.get(
-                "match_score",
-                0,
-            )
-        )
+        decision = result.get("decision")
 
-        confidence = self.clamp(
-            result.get(
-                "confidence",
-                0,
-            )
-        )
+        if decision not in DECISIONS:
+            decision = "needs_review"
 
-        decision = self.normalize_decision(
-            result.get(
-                "decision"
-            )
-        )
+        evidence = result.get("evidence")
 
-        reasoning = result.get(
-            "reasoning"
-        )
+        if not isinstance(evidence, dict):
+            evidence = {"notes": evidence} if evidence else {}
 
-        evidence = result.get(
-            "evidence"
-        )
-
-        if not isinstance(
-            evidence,
-            dict,
-        ):
-            evidence = {}
+        reasoning = result.get("reasoning")
 
         return {
             "prospect_id": prospect["id"],
             "icp_id": icp["id"],
-            "match_score": match_score,
-            "confidence": confidence,
+            "match_score": clamp_score(result.get("match_score", 0)),
+            "confidence": clamp_score(result.get("confidence", 0)),
             "decision": decision,
-            "reasoning": (
-                str(reasoning)
-                if reasoning
-                else None
-            ),
+            "reasoning": str(reasoning) if reasoning else None,
             "evidence": evidence,
             "status": "completed",
+            "evaluated_at": datetime.now(timezone.utc).isoformat(),
         }
-
-    # ========================================================
-    # FAILED RESULT
-    # ========================================================
 
     def build_failed_result(
         self,
@@ -831,44 +516,23 @@ Rules:
             "match_score": 0,
             "confidence": 0,
             "decision": "needs_review",
-            "reasoning": (
-                "ICP evaluation could not be completed."
-            ),
-            "evidence": {
-                "error": error,
-            },
+            "reasoning": "ICP evaluation could not be completed.",
+            "evidence": {"error": error},
             "status": "failed",
+            "evaluated_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    # ========================================================
-    # SAVE RESULTS
-    # ========================================================
-
-    def save_results(
-        self,
-        results: list[dict],
-    ):
+    def save_results(self, results: list[dict]) -> None:
 
         if not results:
             return
 
         (
             supabase
-            .table(
-                "prospect_icp_matches"
-            )
-            .upsert(
-                results,
-                on_conflict=(
-                    "prospect_id,icp_id"
-                ),
-            )
+            .table("prospect_icp_matches")
+            .upsert(results, on_conflict="prospect_id,icp_id")
             .execute()
         )
-
-    # ========================================================
-    # BUILD METRICS
-    # ========================================================
 
     def build_summary(
         self,
@@ -880,98 +544,41 @@ Rules:
         failed: int,
     ) -> dict[str, Any]:
 
-        qualified = sum(
-            1
-            for result in results
-            if (
-                result["status"]
-                == "completed"
-                and result["decision"]
-                == "qualified"
+        def count(**criteria) -> int:
+            return sum(
+                1
+                for result in results
+                if all(
+                    result.get(key) == value
+                    for key, value in criteria.items()
+                )
             )
-        )
-
-        disqualified = sum(
-            1
-            for result in results
-            if (
-                result["status"]
-                == "completed"
-                and result["decision"]
-                == "disqualified"
-            )
-        )
-
-        needs_review = sum(
-            1
-            for result in results
-            if result["decision"]
-            == "needs_review"
-        )
-
-        completed = sum(
-            1
-            for result in results
-            if result["status"]
-            == "completed"
-        )
 
         return {
             "icp_id": icp_id,
             "campaign_id": campaign_id,
             "company_ids": company_ids,
-            "total_companies": len(
-                company_ids
-            ),
+            "total_companies": len(company_ids),
             "total_prospects": total,
-            "processed": completed,
+            "processed": count(status="completed"),
             "failed": failed,
-            "qualified": qualified,
-            "disqualified": disqualified,
-            "needs_review": needs_review,
-        }
-
-    # ========================================================
-    # HELPERS
-    # ========================================================
-
-    @staticmethod
-    def clamp(
-        value: Any,
-    ) -> float:
-
-        try:
-            value = float(value)
-
-        except (
-            ValueError,
-            TypeError,
-        ):
-            return 0
-
-        return round(
-            max(
-                0,
-                min(
-                    100,
-                    value,
-                ),
+            "qualified": count(status="completed", decision="qualified"),
+            "disqualified": count(
+                status="completed",
+                decision="disqualified",
             ),
-            2,
-        )
-
-    @staticmethod
-    def normalize_decision(
-        decision: Any,
-    ) -> str:
-
-        allowed = {
-            "qualified",
-            "disqualified",
-            "needs_review",
+            "needs_review": count(decision="needs_review"),
         }
 
-        if decision in allowed:
-            return decision
 
-        return "needs_review"
+async def run_icp_fitment(
+    icp_id: str,
+    company_ids: list[str] | None = None,
+    prospect_ids: list[str] | None = None,
+) -> dict[str, Any]:
+
+    return await ICPFitmentAgent().run(
+        icp_id=icp_id,
+        company_ids=company_ids,
+        prospect_ids=prospect_ids,
+    )

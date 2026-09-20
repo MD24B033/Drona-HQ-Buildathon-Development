@@ -1,160 +1,87 @@
+"""Prospect Discovery Agent.
+
+Finds real people at a target company who look relevant to an ICP,
+writes them to `prospects`, and optionally hands each one to the ICP
+Fitment Agent.
+"""
+
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-import os
 from typing import Any
 
-from google import genai
-from pydantic import BaseModel, Field
-
-from supabase.client import supabase
-from icp_fitment import run_icp_fitment
+from core.config import DISCOVERY_MAX_CANDIDATES, model_for
+from core.gemini import client as gemini, parse_json_object
+from db.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3-flash-preview",
-)
-
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not configured")
-
-gemini = genai.Client(api_key=GEMINI_API_KEY)
-
-
-# ============================================================
-# OUTPUT SCHEMAS
-# ============================================================
-
-class ProspectCandidate(BaseModel):
-    full_name: str = Field(
-        description="Full name of the person."
-    )
-
-    current_title: str | None = Field(
-        default=None,
-        description="Current professional job title."
-    )
-
-    linkedin_url: str | None = Field(
-        default=None,
-        description="Public LinkedIn profile URL if found."
-    )
-
-    country: str | None = None
-
-    city: str | None = None
-
-    functional_area: str | None = Field(
-        default=None,
-        description="Functional area such as Engineering, Product, Sales, Finance."
-    )
-
-    areas_of_expertise: list[str] = Field(
-        default_factory=list
-    )
-
-    reasoning: str = Field(
-        description="Why this person appears relevant to the ICP."
-    )
-
-    evidence: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Evidence supporting the candidate."
-    )
-
-    sources: list[str] = Field(
-        default_factory=list,
-        description="URLs supporting the candidate."
-    )
-
-
-class ProspectDiscoveryResult(BaseModel):
-    candidates: list[ProspectCandidate] = Field(
-        default_factory=list
-    )
-
-
-# ============================================================
-# PROMPT
-# ============================================================
-
 SYSTEM_PROMPT = """
 You are a Prospect Discovery Agent for a B2B sales platform.
 
-Your job is to find REAL PEOPLE who work at a SPECIFIC COMPANY
-and appear relevant to a specific Ideal Customer Profile (ICP).
+Your job is to find REAL PEOPLE who work at a SPECIFIC COMPANY and
+appear relevant to a specific Ideal Customer Profile (ICP).
 
-You are NOT the final ICP qualification agent.
+You are NOT the final ICP qualification agent. Your task is discovery.
 
-Your task is discovery.
-
-INPUTS:
-
-1. Company information
-2. ICP information
-
-You must search the web to find potential people at the company
-who match the ICP's person-level requirements.
+Search the web to find potential people at the company who match the
+ICP's person-level requirements.
 
 IMPORTANT RULES:
 
-- Only return real people who have credible evidence of working
-  at the specified company.
-- Do not invent people.
-- Do not invent job titles.
-- Do not invent LinkedIn URLs.
-- Do not invent geography.
-- Do not assume someone works at the company merely because
-  their name appears in an unrelated article.
+- Only return real people who have credible evidence of working at the
+  specified company.
+- Do not invent people, job titles, LinkedIn URLs or geography.
+- Do not assume someone works at the company merely because their name
+  appears in an unrelated article.
 - Prefer official company pages, public professional profiles,
-  conference speaker pages, reputable publications, and other
-  credible sources.
-- LinkedIn URLs may be returned only when you actually find
-  evidence for that profile.
-- If you cannot verify a LinkedIn URL, return null.
-- If you cannot verify a field, return null.
+  conference speaker pages and reputable publications.
+- If you cannot verify a field, return null for it.
 - Never fabricate missing information.
 
 ICP INTERPRETATION:
 
-Use the ICP to identify relevant people.
+Pay particular attention to target job titles, seniority, functional
+area, geography, expertise, company characteristics, and any explicit
+inclusion or exclusion criteria.
 
-Pay particular attention to:
+Do NOT perform the final qualification decision. A candidate may be
+returned even when some information is missing, provided there is
+credible evidence that the person works at the company.
 
-- target job titles
-- seniority
-- functional area
-- geography
-- expertise
-- company characteristics
-- explicit inclusion criteria
-- explicit exclusions
+Return only structured candidate data. Do not write outreach messages
+or sales copy.
 
-Do NOT perform the final qualification decision.
+Return JSON only, in exactly this shape:
 
-A candidate can be returned even if some information is missing,
-provided there is credible evidence that the person works at the
-company and may fit the ICP.
-
-Return only structured candidate data.
-Do not write outreach messages.
-Do not write sales copy.
+{
+  "candidates": [
+    {
+      "full_name": "",
+      "current_title": null,
+      "linkedin_url": null,
+      "country": null,
+      "city": null,
+      "functional_area": null,
+      "areas_of_expertise": [],
+      "reasoning": "",
+      "evidence": {},
+      "sources": []
+    }
+  ]
+}
 """
 
 
 # ============================================================
-# HELPERS
+# DATA ACCESS
 # ============================================================
 
 def fetch_company(company_id: str) -> dict[str, Any]:
+
     response = (
         supabase
         .table("companies")
@@ -173,45 +100,40 @@ def fetch_company(company_id: str) -> dict[str, Any]:
             """
         )
         .eq("id", company_id)
-        .single()
+        .maybe_single()
         .execute()
     )
 
-    if not response.data:
-        raise ValueError(
-            f"Company not found: {company_id}"
-        )
+    if not response or not response.data:
+        raise ValueError(f"Company not found: {company_id}")
 
     return response.data
 
 
 def fetch_icp(icp_id: str) -> dict[str, Any]:
+
     response = (
         supabase
         .table("icps")
-        .select(
-            """
-            id,
-            campaign_id,
-            name,
-            description,
-            criteria
-            """
-        )
+        .select("id, campaign_id, name, description, criteria")
         .eq("id", icp_id)
-        .single()
+        .maybe_single()
         .execute()
     )
 
-    if not response.data:
-        raise ValueError(
-            f"ICP not found: {icp_id}"
-        )
+    if not response or not response.data:
+        raise ValueError(f"ICP not found: {icp_id}")
 
     return response.data
 
 
 def fetch_campaign(campaign_id: str) -> dict[str, Any]:
+    """Load the campaign columns that steer discovery.
+
+    Note: the campaign itself has no `icp` column - ICPs live in their
+    own table and are passed in separately.
+    """
+
     response = (
         supabase
         .table("campaigns")
@@ -219,7 +141,6 @@ def fetch_campaign(campaign_id: str) -> dict[str, Any]:
             """
             id,
             profile_id,
-            icp,
             geography,
             target_personas,
             objective,
@@ -234,17 +155,19 @@ def fetch_campaign(campaign_id: str) -> dict[str, Any]:
             """
         )
         .eq("id", campaign_id)
-        .single()
+        .maybe_single()
         .execute()
     )
 
-    if not response.data:
-        raise ValueError(
-            f"Campaign not found: {campaign_id}"
-        )
+    if not response or not response.data:
+        raise ValueError(f"Campaign not found: {campaign_id}")
 
     return response.data
 
+
+# ============================================================
+# GEMINI DISCOVERY
+# ============================================================
 
 def build_prompt(
     company: dict[str, Any],
@@ -252,146 +175,153 @@ def build_prompt(
     campaign: dict[str, Any],
 ) -> str:
 
+    company_json = json.dumps(company, indent=2, default=str)
+    icp_json = json.dumps(icp, indent=2, default=str)
+    campaign_json = json.dumps(campaign, indent=2, default=str)
+
     return f"""
-Find potential prospects at the following company who are relevant
-to the supplied ICP.
+Find potential prospects at the following company who are relevant to
+the supplied ICP.
 
 ========================
 COMPANY
 ========================
 
-{company}
+{company_json}
 
 ========================
 ICP
 ========================
 
-{icp}
+{icp_json}
 
 ========================
 CAMPAIGN
 ========================
 
-{campaign}
+{campaign_json}
 
 ========================
 DISCOVERY REQUIREMENTS
 ========================
 
-Find people who appear to match the ICP's target personas.
+Find people who appear to match the ICP's target personas. Search for
+current employees, their current job title, seniority, functional area,
+public professional profile, relevant expertise and geography.
 
-Search for:
+Prioritise people with strong evidence of being current employees of
+this company.
 
-- current employees
-- current job title
-- seniority
-- functional area
-- public professional profile
-- relevant expertise
-- geography where relevant
+Return up to {DISCOVERY_MAX_CANDIDATES} strong candidates. Do not return
+generic employees merely because they work there.
 
-Prioritize people who have strong evidence of being current
-employees of this company.
+For every candidate provide: full_name, current_title, linkedin_url if
+verified, country if verified, city if verified, functional_area,
+areas_of_expertise, reasoning, evidence and sources.
 
-Return up to 20 strong candidate prospects.
-
-Do not return generic employees merely because they work there.
-
-For every candidate provide:
-
-- full_name
-- current_title
-- linkedin_url if verified
-- country if verified
-- city if verified
-- functional_area
-- areas_of_expertise
-- reasoning
-- evidence
-- sources
-
-Again:
-
-DO NOT invent information.
+Again: DO NOT invent information. Return JSON only.
 """
 
 
-# ============================================================
-# GEMINI DISCOVERY
-# ============================================================
-
-def discover_with_gemini(
+async def discover_with_gemini(
     company: dict[str, Any],
     icp: dict[str, Any],
     campaign: dict[str, Any],
-) -> ProspectDiscoveryResult:
+) -> list[dict[str, Any]]:
+    """Ask Gemini, with Google Search grounding, for candidate people."""
 
-    prompt = build_prompt(
-        company=company,
-        icp=icp,
-        campaign=campaign,
-    )
+    prompt = build_prompt(company=company, icp=icp, campaign=campaign)
 
-    response = gemini.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "text": (
-                            SYSTEM_PROMPT
-                            + "\n\n"
-                            + prompt
-                        )
-                    }
-                ],
-            }
-        ],
+    response = await gemini.aio.models.generate_content(
+        model=model_for("prospect_discovery"),
+        contents=SYSTEM_PROMPT + "\n\n" + prompt,
         config={
-            "response_mime_type": "application/json",
-            "response_schema": ProspectDiscoveryResult,
-
-            # Gemini uses Google Search grounding to find
-            # current public information.
-            "tools": [
-                {
-                    "google_search": {}
-                }
-            ],
+            # Grounded calls cannot also force a JSON mime type, so the
+            # JSON object is parsed out of the text response.
+            "tools": [{"google_search": {}}],
         },
     )
 
     if not response.text:
-        raise RuntimeError(
-            "Gemini returned an empty response"
-        )
+        raise RuntimeError("Gemini returned an empty discovery response")
 
-    return ProspectDiscoveryResult.model_validate_json(
-        response.text
-    )
+    result = parse_json_object(response.text)
+
+    candidates = result.get("candidates")
+
+    if not isinstance(candidates, list):
+        return []
+
+    return [
+        normalize_candidate(candidate)
+        for candidate in candidates
+        if isinstance(candidate, dict)
+        and str(candidate.get("full_name") or "").strip()
+    ][:DISCOVERY_MAX_CANDIDATES]
+
+
+def normalize_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+
+    def text(key: str) -> str | None:
+        value = candidate.get(key)
+
+        if value is None:
+            return None
+
+        value = str(value).strip()
+
+        return value or None
+
+    expertise = candidate.get("areas_of_expertise")
+
+    if not isinstance(expertise, list):
+        expertise = []
+
+    evidence = candidate.get("evidence")
+
+    if not isinstance(evidence, dict):
+        evidence = {"notes": evidence} if evidence else {}
+
+    sources = candidate.get("sources")
+
+    if not isinstance(sources, list):
+        sources = []
+
+    return {
+        "full_name": str(candidate.get("full_name")).strip(),
+        "current_title": text("current_title"),
+        "linkedin_url": text("linkedin_url"),
+        "country": text("country"),
+        "city": text("city"),
+        "functional_area": text("functional_area"),
+        "areas_of_expertise": [
+            str(item).strip()
+            for item in expertise
+            if str(item).strip()
+        ],
+        "reasoning": text("reasoning") or "",
+        "evidence": evidence,
+        "sources": [str(item) for item in sources],
+    }
 
 
 # ============================================================
-# EXISTING PROSPECT LOOKUP
+# PERSISTENCE
 # ============================================================
 
 def find_existing_prospect(
     company_id: str,
-    candidate: ProspectCandidate,
+    candidate: dict[str, Any],
 ) -> dict[str, Any] | None:
+    """LinkedIn is the strongest dedup key; fall back to company + name."""
 
-    # LinkedIn is the strongest deduplication key.
-    if candidate.linkedin_url:
+    if candidate.get("linkedin_url"):
 
         response = (
             supabase
             .table("prospects")
             .select("*")
-            .eq(
-                "linkedin_url",
-                candidate.linkedin_url,
-            )
+            .eq("linkedin_url", candidate["linkedin_url"])
             .limit(1)
             .execute()
         )
@@ -399,13 +329,12 @@ def find_existing_prospect(
         if response.data:
             return response.data[0]
 
-    # Fallback to company + full name.
     response = (
         supabase
         .table("prospects")
         .select("*")
         .eq("company_id", company_id)
-        .eq("full_name", candidate.full_name)
+        .eq("full_name", candidate["full_name"])
         .limit(1)
         .execute()
     )
@@ -416,13 +345,9 @@ def find_existing_prospect(
     return None
 
 
-# ============================================================
-# UPSERT PROSPECT
-# ============================================================
-
 def save_prospect(
     company_id: str,
-    candidate: ProspectCandidate,
+    candidate: dict[str, Any],
 ) -> dict[str, Any]:
 
     existing = find_existing_prospect(
@@ -430,37 +355,32 @@ def save_prospect(
         candidate=candidate,
     )
 
+    discovery_context = {
+        "reasoning": candidate["reasoning"],
+        "evidence": candidate["evidence"],
+        "sources": candidate["sources"],
+    }
+
     payload = {
         "company_id": company_id,
-        "full_name": candidate.full_name,
-        "current_title": candidate.current_title,
-        "linkedin_url": candidate.linkedin_url,
-        "country": candidate.country,
-        "city": candidate.city,
-        "functional_area": candidate.functional_area,
-        "areas_of_expertise": candidate.areas_of_expertise,
-        "context": {
-            "discovery": {
-                "reasoning": candidate.reasoning,
-                "evidence": candidate.evidence,
-                "sources": candidate.sources,
-            }
-        },
+        "full_name": candidate["full_name"],
+        "current_title": candidate["current_title"],
+        "linkedin_url": candidate["linkedin_url"],
+        "country": candidate["country"],
+        "city": candidate["city"],
+        "functional_area": candidate["functional_area"],
+        "areas_of_expertise": candidate["areas_of_expertise"],
+        "context": {"discovery": discovery_context},
     }
 
     if existing:
-
-        # Preserve existing context where possible.
-        old_context = existing.get("context") or {}
+        # Preserve anything already stored alongside the discovery notes.
+        old_context = existing.get("context")
 
         if not isinstance(old_context, dict):
             old_context = {}
 
-        old_context["discovery"] = {
-            "reasoning": candidate.reasoning,
-            "evidence": candidate.evidence,
-            "sources": candidate.sources,
-        }
+        old_context["discovery"] = discovery_context
 
         payload["context"] = old_context
 
@@ -473,7 +393,6 @@ def save_prospect(
         )
 
     else:
-
         response = (
             supabase
             .table("prospects")
@@ -483,50 +402,17 @@ def save_prospect(
 
     if not response.data:
         raise RuntimeError(
-            f"Failed to save prospect: "
-            f"{candidate.full_name}"
+            f"Failed to save prospect: {candidate['full_name']}"
         )
 
     return response.data[0]
 
 
 # ============================================================
-# SAVE DISCOVERY STATUS
+# PIPELINE
 # ============================================================
 
-def mark_discovery_status(
-    prospect_id: str,
-    icp_id: str,
-    status: str,
-    reasoning: str | None = None,
-) -> None:
-
-    # We don't create an ICP match here unless fitment runs.
-    # This function is optional and can be removed if you don't
-    # want discovery state stored in prospect_icp_matches.
-
-    payload = {
-        "status": status,
-    }
-
-    if reasoning:
-        payload["reasoning"] = reasoning
-
-    (
-        supabase
-        .table("prospect_icp_matches")
-        .update(payload)
-        .eq("prospect_id", prospect_id)
-        .eq("icp_id", icp_id)
-        .execute()
-    )
-
-
-# ============================================================
-# FULL DISCOVERY PIPELINE
-# ============================================================
-
-def run_prospect_discovery(
+async def run_prospect_discovery(
     company_id: str,
     icp_id: str,
     run_fitment: bool = True,
@@ -538,79 +424,60 @@ def run_prospect_discovery(
         icp_id,
     )
 
-    # ----------------------------------------
-    # 1. Fetch company
-    # ----------------------------------------
+    company = await asyncio.to_thread(fetch_company, company_id)
 
-    company = fetch_company(company_id)
+    icp = await asyncio.to_thread(fetch_icp, icp_id)
 
-    # ----------------------------------------
-    # 2. Fetch ICP
-    # ----------------------------------------
-
-    icp = fetch_icp(icp_id)
-
-    # ----------------------------------------
-    # 3. Fetch campaign
-    # ----------------------------------------
-
-    campaign = fetch_campaign(
-        icp["campaign_id"]
+    campaign = await asyncio.to_thread(
+        fetch_campaign,
+        icp["campaign_id"],
     )
 
-    # ----------------------------------------
-    # 4. Discover people
-    # ----------------------------------------
-
-    discovery_result = discover_with_gemini(
+    candidates = await discover_with_gemini(
         company=company,
         icp=icp,
         campaign=campaign,
     )
 
-    saved_prospects = []
+    saved_prospects: list[dict[str, Any]] = []
 
-    # ----------------------------------------
-    # 5. Save prospects
-    # ----------------------------------------
-
-    for candidate in discovery_result.candidates:
+    for candidate in candidates:
 
         try:
-
-            prospect = save_prospect(
-                company_id=company_id,
-                candidate=candidate,
+            prospect = await asyncio.to_thread(
+                save_prospect,
+                company_id,
+                candidate,
             )
 
             saved_prospects.append(
                 {
                     "prospect": prospect,
-                    "candidate": candidate.model_dump(),
+                    "candidate": candidate,
                 }
             )
 
         except Exception:
             logger.exception(
                 "Failed to save discovered prospect %s",
-                candidate.full_name,
+                candidate.get("full_name"),
             )
 
-    # ----------------------------------------
-    # 6. Run ICP fitment
-    # ----------------------------------------
+    fitment_results: list[dict[str, Any]] = []
 
-    fitment_results = []
+    if run_fitment and saved_prospects:
 
-    if run_fitment:
+        # Imported here to avoid a circular import at module load time.
+        from agents.ICP_fitment.agent import ICPFitmentAgent
+
+        fitment_agent = ICPFitmentAgent()
 
         for item in saved_prospects:
 
             prospect_id = item["prospect"]["id"]
 
             try:
-
-                fitment = run_icp_fitment(
+                result = await fitment_agent.evaluate_one(
                     prospect_id=prospect_id,
                     icp_id=icp_id,
                 )
@@ -618,15 +485,13 @@ def run_prospect_discovery(
                 fitment_results.append(
                     {
                         "prospect_id": prospect_id,
-                        "result": fitment,
+                        "result": result,
                     }
                 )
 
-            except Exception:
-
+            except Exception as exc:
                 logger.exception(
-                    "ICP fitment failed "
-                    "prospect=%s icp=%s",
+                    "ICP fitment failed prospect=%s icp=%s",
                     prospect_id,
                     icp_id,
                 )
@@ -634,17 +499,16 @@ def run_prospect_discovery(
                 fitment_results.append(
                     {
                         "prospect_id": prospect_id,
-                        "error": "ICP fitment failed",
+                        "error": str(exc),
                     }
                 )
 
     return {
         "company_id": company_id,
         "icp_id": icp_id,
+        "campaign_id": icp["campaign_id"],
         "company_name": company["name"],
-        "discovered_count": len(
-            discovery_result.candidates
-        ),
+        "discovered_count": len(candidates),
         "saved_count": len(saved_prospects),
         "fitment_count": len(fitment_results),
         "prospects": saved_prospects,
@@ -652,35 +516,28 @@ def run_prospect_discovery(
     }
 
 
-# ============================================================
-# BATCH DISCOVERY
-# ============================================================
-
-def run_prospect_discovery_batch(
+async def run_prospect_discovery_batch(
     company_ids: list[str],
     icp_id: str,
     run_fitment: bool = True,
 ) -> list[dict[str, Any]]:
 
-    results = []
+    results: list[dict[str, Any]] = []
 
     for company_id in company_ids:
 
         try:
-
-            result = run_prospect_discovery(
-                company_id=company_id,
-                icp_id=icp_id,
-                run_fitment=run_fitment,
+            results.append(
+                await run_prospect_discovery(
+                    company_id=company_id,
+                    icp_id=icp_id,
+                    run_fitment=run_fitment,
+                )
             )
 
-            results.append(result)
-
         except Exception as exc:
-
             logger.exception(
-                "Prospect discovery failed "
-                "company=%s icp=%s",
+                "Prospect discovery failed company=%s icp=%s",
                 company_id,
                 icp_id,
             )

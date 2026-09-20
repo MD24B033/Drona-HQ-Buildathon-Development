@@ -1,120 +1,148 @@
+"""Personalization Agent.
+
+Writes the actual outreach message for one prospect, grounded in that
+prospect's research, ICP fit, outreach strategy and the campaign
+knowledge base. The draft is recorded as an `outreach_events` row so the
+Conversation Agent can pick it up and send it.
+"""
+
+import asyncio
 import json
-import os
 from typing import Any
 
-from google import genai
-from google.genai import types
-
+from core.config import model_for
+from core.gemini import clamp_score, generate_json
+from core.runs import record_event
 from db.supabase_client import supabase
+from rag.retrieval import format_knowledge_context, retrieve_knowledge
+
+
+REQUIRED_FIELDS = [
+    "channel",
+    "subject",
+    "message",
+    "personalization_angle",
+    "personalization_points",
+    "call_to_action",
+    "evidence",
+    "confidence",
+]
+
+VALID_CHANNELS = {"email", "linkedin", "sms", "voice"}
 
 
 class PersonalizationAgent:
-    def __init__(self):
-        api_key = os.getenv("GEMINI_API_KEY")
 
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY is not configured")
+    agent_type = "personalization"
 
-        self.client = genai.Client(api_key=api_key)
-
-        self.model = os.getenv(
-            "PERSONALIZATION_MODEL",
-            "gemini-3.6-flash",
-        )
-
-        self.embedding_model = os.getenv(
-            "EMBEDDING_MODEL",
-            "gemini-embedding-001",
-        )
-
-        self.top_k = int(
-            os.getenv("RAG_TOP_K", "8")
-        )
-
-        self.min_similarity = float(
-            os.getenv("RAG_MIN_SIMILARITY", "0.35")
-        )
+    def __init__(self, system_prompt: str | None = None):
+        self.model = model_for("personalization")
+        self.system_prompt = system_prompt
 
     async def run(
         self,
-        icp_id: str,
         prospect_id: str,
+        icp_id: str | None = None,
+        campaign_id: str | None = None,
     ) -> dict[str, Any]:
+        """Draft a message for `prospect_id`.
 
-        context = await self._load_context(
-            icp_id=icp_id,
-            prospect_id=prospect_id,
+        Either `icp_id` or `campaign_id` must be supplied; the ICP is
+        used to resolve the campaign when only it is given.
+        """
+
+        if not icp_id and not campaign_id:
+            raise ValueError(
+                "Either icp_id or campaign_id must be provided."
+            )
+
+        context = await asyncio.to_thread(
+            self._load_context,
+            prospect_id,
+            icp_id,
+            campaign_id,
         )
 
-        rag_context = await self._retrieve_rag(
-            campaign_id=context["campaign"]["id"],
-            context=context,
+        resolved_campaign_id = context["campaign"]["id"]
+
+        rag_chunks = await retrieve_knowledge(
+            campaign_id=resolved_campaign_id,
+            query=self._build_rag_query(context),
         )
 
-        prompt = self._build_prompt(
-            context=context,
-            rag_context=rag_context,
+        result = await generate_json(
+            model=self.model,
+            prompt=self._build_prompt(
+                context=context,
+                rag_context=format_knowledge_context(rag_chunks),
+            ),
+            system_instruction=self.system_prompt,
         )
 
-        result = await self._generate(prompt)
+        personalization = self._normalize(result, context)
+
+        event = await asyncio.to_thread(
+            record_event,
+            resolved_campaign_id,
+            "message_drafted",
+            "completed",
+            personalization,
+            prospect_id,
+            self.agent_type,
+            personalization["channel"],
+        )
 
         return {
             "success": True,
             "agent": "personalization",
-            "icp_id": icp_id,
+            "icp_id": context["icp"]["id"] if context["icp"] else None,
             "prospect_id": prospect_id,
-            "campaign_id": context["campaign"]["id"],
-            "personalization": result,
-            "rag": {
-                "chunks_used": len(rag_context),
-            },
+            "campaign_id": resolved_campaign_id,
+            "personalization": personalization,
+            "event_id": event["id"] if event else None,
+            "rag_chunks_used": len(rag_chunks),
         }
 
-    async def _load_context(
+    # ========================================================
+    # CONTEXT
+    # ========================================================
+
+    def _load_context(
         self,
-        icp_id: str,
         prospect_id: str,
+        icp_id: str | None,
+        campaign_id: str | None,
     ) -> dict[str, Any]:
 
-        icp_response = (
-            supabase
-            .table("icps")
-            .select(
-                "id, campaign_id, name, description, criteria"
+        icp = None
+
+        if icp_id:
+            icp_response = (
+                supabase
+                .table("icps")
+                .select("id, campaign_id, name, description, criteria")
+                .eq("id", icp_id)
+                .maybe_single()
+                .execute()
             )
-            .eq("id", icp_id)
-            .single()
-            .execute()
-        )
 
-        icp = icp_response.data
+            icp = icp_response.data if icp_response else None
 
-        if not icp:
-            raise ValueError("ICP not found")
+            if not icp:
+                raise ValueError("ICP not found")
+
+            campaign_id = icp["campaign_id"]
 
         prospect_response = (
             supabase
             .table("prospects")
-            .select(
-                """
-                id,
-                company_id,
-                full_name,
-                current_title,
-                linkedin_url,
-                country,
-                city,
-                functional_area,
-                areas_of_expertise,
-                context
-                """
-            )
+            .select("*")
             .eq("id", prospect_id)
-            .single()
+            .maybe_single()
             .execute()
         )
 
-        prospect = prospect_response.data
+        prospect = prospect_response.data if prospect_response else None
 
         if not prospect:
             raise ValueError("Prospect not found")
@@ -123,12 +151,12 @@ class PersonalizationAgent:
             supabase
             .table("campaigns")
             .select("*")
-            .eq("id", icp["campaign_id"])
-            .single()
+            .eq("id", campaign_id)
+            .maybe_single()
             .execute()
         )
 
-        campaign = campaign_response.data
+        campaign = campaign_response.data if campaign_response else None
 
         if not campaign:
             raise ValueError("Campaign not found")
@@ -139,93 +167,28 @@ class PersonalizationAgent:
             company_response = (
                 supabase
                 .table("companies")
-                .select(
-                    """
-                    id,
-                    name,
-                    website,
-                    linkedin_url,
-                    industry,
-                    employee_count,
-                    country,
-                    city,
-                    description,
-                    context
-                    """
-                )
+                .select("*")
                 .eq("id", prospect["company_id"])
-                .single()
-                .execute()
-            )
-
-            company = company_response.data
-
-        icp_match = None
-
-        try:
-            match_response = (
-                supabase
-                .table("prospect_icp_matches")
-                .select(
-                    """
-                    id,
-                    prospect_id,
-                    icp_id,
-                    match_score,
-                    confidence,
-                    decision,
-                    reasoning,
-                    evidence,
-                    status,
-                    evaluated_at
-                    """
-                )
-                .eq("prospect_id", prospect_id)
-                .eq("icp_id", icp_id)
                 .maybe_single()
                 .execute()
             )
 
-            icp_match = match_response.data
+            company = company_response.data if company_response else None
 
-        except Exception:
-            icp_match = None
+        icp_match = self._best_icp_match(prospect_id, campaign_id, icp_id)
 
-        research = None
+        # If no ICP was supplied, fall back to the one the prospect
+        # actually matched inside this campaign.
+        if not icp and icp_match and icp_match.get("icps"):
+            icp = icp_match["icps"]
 
-        try:
-            research_response = (
-                supabase
-                .table("prospect_research")
-                .select("*")
-                .eq("prospect_id", prospect_id)
-                .eq("campaign_id", icp["campaign_id"])
-                .maybe_single()
-                .execute()
-            )
+        research = self._maybe_single(
+            "prospect_research", prospect_id, campaign_id
+        )
 
-            research = research_response.data
-
-        except Exception:
-            research = None
-
-        strategy = None
-
-        try:
-            strategy_response = (
-                supabase
-                .table("outreach_strategies")
-                .select("*")
-                .eq("prospect_id", prospect_id)
-                .eq("campaign_id", icp["campaign_id"])
-                .maybe_single()
-                .execute()
-            )
-
-            strategy = strategy_response.data
-
-        except Exception:
-            strategy = None
+        strategy = self._maybe_single(
+            "outreach_strategies", prospect_id, campaign_id
+        )
 
         return {
             "icp": icp,
@@ -237,150 +200,142 @@ class PersonalizationAgent:
             "strategy": strategy,
         }
 
-    async def _create_embedding(
+    def _best_icp_match(
         self,
-        text: str,
-    ) -> list[float]:
-
-        response = await self.client.aio.models.embed_content(
-            model=self.embedding_model,
-            contents=text,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_QUERY",
-                output_dimensionality=768,
-            ),
-        )
-
-        if not response.embeddings:
-            raise RuntimeError(
-                "Gemini returned no embedding"
-            )
-
-        return list(
-            response.embeddings[0].values
-        )
-
-    async def _retrieve_rag(
-        self,
+        prospect_id: str,
         campaign_id: str,
-        context: dict[str, Any],
-    ) -> list[dict[str, Any]]:
+        icp_id: str | None,
+    ) -> dict[str, Any] | None:
 
-        prospect = context["prospect"]
-        company = context["company"]
-        icp = context["icp"]
-        research = context["research"]
+        query = (
+            supabase
+            .table("prospect_icp_matches")
+            .select(
+                """
+                *,
+                icps!inner (
+                    id,
+                    campaign_id,
+                    name,
+                    description,
+                    criteria
+                )
+                """
+            )
+            .eq("prospect_id", prospect_id)
+            .eq("icps.campaign_id", campaign_id)
+        )
 
-        query_parts = [
-            f"ICP: {icp.get('name', '')}",
-            f"ICP description: {icp.get('description', '')}",
-            f"ICP criteria: {json.dumps(icp.get('criteria', {}))}",
-            f"Prospect: {prospect.get('full_name', '')}",
-            f"Title: {prospect.get('current_title', '')}",
-            f"Functional area: {prospect.get('functional_area', '')}",
-            f"Expertise: {json.dumps(prospect.get('areas_of_expertise', []))}",
-        ]
-
-        if company:
-            query_parts.extend([
-                f"Company: {company.get('name', '')}",
-                f"Industry: {company.get('industry', '')}",
-                f"Company description: {company.get('description', '')}",
-            ])
-
-        if research:
-            query_parts.extend([
-                f"Research summary: {research.get('summary', '')}",
-                f"Pain points: {json.dumps(research.get('pain_points', []))}",
-                f"Buying signals: {json.dumps(research.get('buying_signals', []))}",
-                f"Technologies: {json.dumps(research.get('technologies', []))}",
-            ])
-
-        query = "\n".join(query_parts)
-
-        embedding = await self._create_embedding(query)
+        if icp_id:
+            query = query.eq("icp_id", icp_id)
 
         response = (
-            supabase
-            .rpc(
-                "match_knowledge_chunks",
-                {
-                    "query_embedding": embedding,
-                    "match_campaign_id": campaign_id,
-                    "match_count": self.top_k,
-                    "min_similarity": self.min_similarity,
-                },
-            )
+            query
+            .order("match_score", desc=True)
+            .limit(1)
             .execute()
         )
 
-        return response.data or []
+        return response.data[0] if response.data else None
+
+    def _maybe_single(
+        self,
+        table: str,
+        prospect_id: str,
+        campaign_id: str,
+    ) -> dict[str, Any] | None:
+
+        response = (
+            supabase
+            .table(table)
+            .select("*")
+            .eq("prospect_id", prospect_id)
+            .eq("campaign_id", campaign_id)
+            .maybe_single()
+            .execute()
+        )
+
+        return response.data if response else None
+
+    def _build_rag_query(self, context: dict[str, Any]) -> str:
+
+        prospect = context["prospect"]
+        company = context["company"]
+        icp = context["icp"] or {}
+        research = context["research"]
+
+        parts = [
+            f"ICP: {icp.get('name', '')}",
+            f"ICP description: {icp.get('description', '')}",
+            f"ICP criteria: {json.dumps(icp.get('criteria') or {})}",
+            f"Prospect: {prospect.get('full_name', '')}",
+            f"Title: {prospect.get('current_title', '')}",
+            f"Functional area: {prospect.get('functional_area', '')}",
+            "Expertise: "
+            f"{json.dumps(prospect.get('areas_of_expertise') or [])}",
+        ]
+
+        if company:
+            parts.extend(
+                [
+                    f"Company: {company.get('name', '')}",
+                    f"Industry: {company.get('industry', '')}",
+                    "Company description: "
+                    f"{company.get('description', '')}",
+                ]
+            )
+
+        if research:
+            parts.extend(
+                [
+                    f"Research summary: {research.get('summary', '')}",
+                    "Pain points: "
+                    f"{json.dumps(research.get('pain_points') or [])}",
+                    "Buying signals: "
+                    f"{json.dumps(research.get('buying_signals') or [])}",
+                    "Technologies: "
+                    f"{json.dumps(research.get('technologies') or [])}",
+                ]
+            )
+
+        return "\n".join(parts)
+
+    # ========================================================
+    # PROMPT
+    # ========================================================
 
     def _build_prompt(
         self,
         context: dict[str, Any],
-        rag_context: list[dict[str, Any]],
+        rag_context: str,
     ) -> str:
 
-        rag_text = "\n\n".join(
-            [
-                (
-                    f"Knowledge {index + 1} "
-                    f"(similarity: {chunk.get('similarity', 0):.3f}):\n"
-                    f"{chunk.get('content', '')}"
-                )
-                for index, chunk in enumerate(rag_context)
-            ]
-        )
-
-        if not rag_text:
-            rag_text = "No relevant campaign knowledge was found."
+        def dump(key: str) -> str:
+            return json.dumps(context[key], indent=2, default=str)
 
         return f"""
 You are the Personalization Agent for a B2B sales automation system.
 
-Your task is to create a highly personalized sales message for one specific prospect who is being evaluated against one specific ICP.
+Your task is to create a highly personalized sales message for one
+specific prospect.
 
-Use ONLY the information provided below.
-
-Never invent facts.
-
-Never assume:
-- company size
-- revenue
-- technologies
-- responsibilities
-- achievements
-- business problems
-- buying intent
-- company initiatives
-- personal interests
-- events
-- metrics
-- products
-- customers
-- results
+Use ONLY the information provided below. Never invent facts. Never
+assume company size, revenue, technologies, responsibilities,
+achievements, business problems, buying intent, company initiatives,
+personal interests, events, metrics, products, customers or results.
 
 Missing information must remain missing.
 
-The goal is to produce a natural sales message that feels relevant to this specific prospect.
+Base the personalization on the strongest available combination of the
+prospect, their company, the ICP criteria and fitment, the research, the
+campaign objective and instructions, and the retrieved knowledge.
 
-The personalization should be based on the strongest available combination of:
-- prospect information
-- company information
-- ICP criteria
-- ICP fitment
-- research
-- campaign objective
-- campaign instructions
-- campaign knowledge
-- RAG context
+Do not mention the ICP, scoring, internal agents, RAG, the database or
+any internal reasoning in the message. Do not make the message sound
+like an AI-generated template. Keep it concise and suitable for a real
+B2B sales interaction.
 
-Do not mention the ICP, scoring system, internal agent, RAG, database, or internal reasoning in the message.
-
-Do not make the message sound like an AI-generated template.
-
-Keep it concise and suitable for a real B2B sales interaction.
+If an outreach strategy is supplied, write for its primary channel.
 
 Return JSON only using this exact structure:
 
@@ -395,77 +350,47 @@ Return JSON only using this exact structure:
     "confidence": 0
 }}
 
-The confidence must be a number from 0 to 100.
+channel must be one of email, linkedin, sms, voice.
+confidence must be a number from 0 to 100.
 
 ICP:
-{json.dumps(context["icp"], indent=2, default=str)}
+{dump("icp")}
 
 CAMPAIGN:
-{json.dumps(context["campaign"], indent=2, default=str)}
+{dump("campaign")}
 
 PROSPECT:
-{json.dumps(context["prospect"], indent=2, default=str)}
+{dump("prospect")}
 
 COMPANY:
-{json.dumps(context["company"], indent=2, default=str)}
+{dump("company")}
 
 ICP FITMENT:
-{json.dumps(context["icp_match"], indent=2, default=str)}
+{dump("icp_match")}
 
 PROSPECT RESEARCH:
-{json.dumps(context["research"], indent=2, default=str)}
+{dump("research")}
 
 OUTREACH STRATEGY:
-{json.dumps(context["strategy"], indent=2, default=str)}
+{dump("strategy")}
 
 RELEVANT CAMPAIGN KNOWLEDGE:
-{rag_text}
+{rag_context}
 """
 
-    async def _generate(
+    # ========================================================
+    # RESULT
+    # ========================================================
+
+    def _normalize(
         self,
-        prompt: str,
+        result: dict[str, Any],
+        context: dict[str, Any],
     ) -> dict[str, Any]:
-
-        response = await self.client.aio.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
-        )
-
-        if not response.text:
-            raise RuntimeError(
-                "Gemini returned an empty response"
-            )
-
-        try:
-            result = json.loads(response.text)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "Gemini returned invalid JSON"
-            ) from exc
-
-        if not isinstance(result, dict):
-            raise RuntimeError(
-                "Gemini returned an invalid response object"
-            )
-
-        required_fields = [
-            "channel",
-            "subject",
-            "message",
-            "personalization_angle",
-            "personalization_points",
-            "call_to_action",
-            "evidence",
-            "confidence",
-        ]
 
         missing = [
             field
-            for field in required_fields
+            for field in REQUIRED_FIELDS
             if field not in result
         ]
 
@@ -474,31 +399,49 @@ RELEVANT CAMPAIGN KNOWLEDGE:
                 f"Missing personalization fields: {missing}"
             )
 
-        confidence = float(
-            result["confidence"]
-        )
+        message = str(result.get("message") or "").strip()
 
-        if confidence < 0 or confidence > 100:
-            raise RuntimeError(
-                "Confidence must be between 0 and 100"
-            )
-
-        if not str(result["message"]).strip():
+        if not message:
             raise RuntimeError(
                 "Generated personalization message is empty"
             )
 
-        return result
+        channel = result.get("channel")
+
+        if channel not in VALID_CHANNELS:
+            strategy = context.get("strategy") or {}
+
+            channel = strategy.get("primary_channel") or "email"
+
+        points = result.get("personalization_points")
+        evidence = result.get("evidence")
+
+        return {
+            "channel": channel,
+            "subject": str(result.get("subject") or "").strip(),
+            "message": message,
+            "personalization_angle": str(
+                result.get("personalization_angle") or ""
+            ).strip(),
+            "personalization_points": (
+                points if isinstance(points, list) else []
+            ),
+            "call_to_action": str(
+                result.get("call_to_action") or ""
+            ).strip(),
+            "evidence": evidence if isinstance(evidence, list) else [],
+            "confidence": clamp_score(result.get("confidence")),
+        }
 
 
 async def personalize_prospect(
-    icp_id: str,
     prospect_id: str,
+    icp_id: str | None = None,
+    campaign_id: str | None = None,
 ) -> dict[str, Any]:
 
-    agent = PersonalizationAgent()
-
-    return await agent.run(
-        icp_id=icp_id,
+    return await PersonalizationAgent().run(
         prospect_id=prospect_id,
+        icp_id=icp_id,
+        campaign_id=campaign_id,
     )

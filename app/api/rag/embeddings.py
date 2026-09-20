@@ -1,17 +1,20 @@
-import os
+"""Gemini embeddings for the campaign knowledge base."""
 
 from google import genai
 from google.genai import types
 
-
-client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
+from core.config import (
+    EMBEDDING_DIMENSIONS,
+    EMBEDDING_MODEL,
+    GEMINI_API_KEY,
 )
 
-EMBEDDING_MODEL = os.getenv(
-    "EMBEDDING_MODEL",
-    "gemini-embedding-001",
-)
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is not configured")
+
+
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 async def create_embedding(
@@ -24,35 +27,19 @@ async def create_embedding(
         contents=text,
         config=types.EmbedContentConfig(
             task_type=task_type,
-            output_dimensionality=768,
+            output_dimensionality=EMBEDDING_DIMENSIONS,
         ),
     )
 
     if not response.embeddings:
-        raise RuntimeError(
-            "Gemini returned no embedding"
-        )
+        raise RuntimeError("Gemini returned no embedding")
 
-    return list(
-        response.embeddings[0].values
-    )
+    return list(response.embeddings[0].values)
 
 
-async def create_document_embedding(
-    text: str,
-) -> list[float]:
-
-    return await create_embedding(
-        text,
-        "RETRIEVAL_DOCUMENT",
-    )
+async def create_document_embedding(text: str) -> list[float]:
+    return await create_embedding(text, "RETRIEVAL_DOCUMENT")
 
 
-async def create_query_embedding(
-    text: str,
-) -> list[float]:
-
-    return await create_embedding(
-        text,
-        "RETRIEVAL_QUERY",
-    )
+async def create_query_embedding(text: str) -> list[float]:
+    return await create_embedding(text, "RETRIEVAL_QUERY")

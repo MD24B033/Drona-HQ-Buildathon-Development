@@ -1,56 +1,56 @@
+"""Outreach Strategy Agent.
+
+Decides who to contact today, on which channel and in what order, then
+writes the plan to `outreach_strategies`. The application - not the
+model - owns the hard daily limits.
+"""
+
+import asyncio
 import json
-import os
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from google import genai
-from google.genai import types
-
+from core.config import (
+    DEFAULT_DAILY_TARGET,
+    MAX_DAILY_TARGET,
+    STRATEGY_MIN_CONFIDENCE,
+    STRATEGY_MIN_MATCH_SCORE,
+    model_for,
+)
+from core.gemini import generate_json
 from db.supabase_client import supabase
-from rag.retrieval import retrieve_knowledge, format_knowledge_context
+from rag.retrieval import format_knowledge_context, retrieve_knowledge
+
+
+CONTACT_EVENT_TYPES = {
+    "message_sent",
+    "outreach_sent",
+    "email_sent",
+    "linkedin_sent",
+    "voice_call",
+}
+
+VALID_CHANNELS = {"email", "linkedin", "sms", "voice"}
 
 
 class StrategyAgent:
-    def __init__(self):
-        api_key = os.getenv("GEMINI_API_KEY")
 
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY is not configured")
+    agent_type = "strategy"
 
-        self.client = genai.Client(api_key=api_key)
+    def __init__(self, system_prompt: str | None = None):
+        self.model = model_for("strategy")
+        self.system_prompt = system_prompt
 
-        self.model = os.getenv(
-            "STRATEGY_MODEL",
-            "gemini-3.6-flash",
+    async def run(self, campaign_id: str) -> dict[str, Any]:
+
+        context = await asyncio.to_thread(
+            self._load_campaign_context,
+            campaign_id,
         )
 
-        self.default_daily_target = int(
-            os.getenv("DEFAULT_DAILY_TARGET", "20")
-        )
+        eligible_prospects = self._get_eligible_prospects(context)
 
-        self.max_daily_target = int(
-            os.getenv("MAX_DAILY_TARGET", "50")
-        )
-
-        self.max_contacts_per_prospect = int(
-            os.getenv("MAX_CONTACTS_PER_PROSPECT", "3")
-        )
-
-    async def run(
-        self,
-        campaign_id: str,
-    ) -> dict[str, Any]:
-
-        context = await self._load_campaign_context(
-            campaign_id
-        )
-
-        eligible_prospects = self._get_eligible_prospects(
-            context
-        )
-
-        usage = self._calculate_usage(
-            context
-        )
+        usage = await asyncio.to_thread(self._calculate_usage, context)
 
         target_count = self._calculate_target_count(
             context,
@@ -58,36 +58,39 @@ class StrategyAgent:
             usage,
         )
 
-        selected_prospects = eligible_prospects[
-            :target_count
-        ]
+        selected_prospects = eligible_prospects[:target_count]
 
-        rag_chunks = await self._retrieve_rag(
-            context,
-            selected_prospects,
-        )
+        rag_chunks = await self._retrieve_rag(context, selected_prospects)
 
-        rag_context = format_knowledge_context(
-            rag_chunks
-        )
-
-        gemini_strategy = await self._generate_strategy(
-            context=context,
-            prospects=selected_prospects,
-            usage=usage,
-            rag_context=rag_context,
-        )
+        if selected_prospects:
+            gemini_strategy = await generate_json(
+                model=self.model,
+                prompt=self._build_prompt(
+                    context=context,
+                    prospects=selected_prospects,
+                    usage=usage,
+                    rag_context=format_knowledge_context(rag_chunks),
+                ),
+                system_instruction=self.system_prompt,
+            )
+        else:
+            gemini_strategy = {
+                "campaign_status": "stopped",
+                "daily_target": 0,
+                "reason": "No eligible prospects are available.",
+                "prospects": [],
+            }
 
         final_strategy = self._apply_hard_limits(
-            context=context,
             prospects=selected_prospects,
             usage=usage,
             gemini_strategy=gemini_strategy,
         )
 
-        stored = await self._store_strategies(
-            campaign_id=campaign_id,
-            strategies=final_strategy["prospects"],
+        stored = await asyncio.to_thread(
+            self._store_strategies,
+            campaign_id,
+            final_strategy["prospects"],
         )
 
         return {
@@ -101,44 +104,44 @@ class StrategyAgent:
                 "remaining_capacity": final_strategy[
                     "remaining_capacity"
                 ],
-                "eligible_prospects": len(
-                    eligible_prospects
-                ),
-                "selected_prospects": len(
-                    selected_prospects
-                ),
+                "eligible_prospects": len(eligible_prospects),
+                "selected_prospects": len(selected_prospects),
                 "prospects": stored,
             },
             "usage": usage,
             "rag_chunks_used": len(rag_chunks),
         }
 
-    async def _load_campaign_context(
-        self,
-        campaign_id: str,
-    ) -> dict[str, Any]:
+    # ========================================================
+    # CONTEXT
+    # ========================================================
+
+    def _load_campaign_context(self, campaign_id: str) -> dict[str, Any]:
 
         campaign_response = (
             supabase
             .table("campaigns")
             .select("*")
             .eq("id", campaign_id)
-            .single()
+            .maybe_single()
             .execute()
         )
 
-        campaign = campaign_response.data
-
-        if not campaign:
+        if not campaign_response or not campaign_response.data:
             raise ValueError("Campaign not found")
 
+        campaign = campaign_response.data
+
+        # `icps!inner` is required: without the inner join PostgREST
+        # would return every match and merely null out the embedded ICP,
+        # so prospects from other campaigns would leak in.
         matches_response = (
             supabase
             .table("prospect_icp_matches")
             .select(
                 """
                 *,
-                prospects (
+                prospects!inner (
                     id,
                     company_id,
                     full_name,
@@ -150,7 +153,7 @@ class StrategyAgent:
                     areas_of_expertise,
                     context
                 ),
-                icps (
+                icps!inner (
                     id,
                     campaign_id,
                     name,
@@ -159,26 +162,32 @@ class StrategyAgent:
                 )
                 """
             )
-            .eq(
-                "icps.campaign_id",
-                campaign_id,
-            )
-            .eq(
-                "decision",
-                "qualified",
-            )
-            .eq(
-                "status",
-                "completed",
-            )
-            .order(
-                "match_score",
-                desc=True,
-            )
+            .eq("icps.campaign_id", campaign_id)
+            .eq("decision", "qualified")
+            .eq("status", "completed")
+            .order("match_score", desc=True)
             .execute()
         )
 
         matches = matches_response.data or []
+
+        prospect_ids = [
+            match["prospects"]["id"]
+            for match in matches
+            if match.get("prospects")
+        ]
+
+        research_by_prospect = self._index_by_prospect(
+            "prospect_research",
+            campaign_id,
+            prospect_ids,
+        )
+
+        strategy_by_prospect = self._index_by_prospect(
+            "outreach_strategies",
+            campaign_id,
+            prospect_ids,
+        )
 
         prospects = []
 
@@ -188,53 +197,50 @@ class StrategyAgent:
             if not prospect:
                 continue
 
-            research_response = (
-                supabase
-                .table("prospect_research")
-                .select("*")
-                .eq(
-                    "prospect_id",
-                    prospect["id"],
-                )
-                .eq(
-                    "campaign_id",
-                    campaign_id,
-                )
-                .maybe_single()
-                .execute()
+            prospects.append(
+                {
+                    "prospect": prospect,
+                    "icp_match": match,
+                    "research": research_by_prospect.get(prospect["id"]),
+                    "existing_strategy": strategy_by_prospect.get(
+                        prospect["id"]
+                    ),
+                }
             )
-
-            research = research_response.data
-
-            strategy_response = (
-                supabase
-                .table("outreach_strategies")
-                .select("*")
-                .eq(
-                    "prospect_id",
-                    prospect["id"],
-                )
-                .eq(
-                    "campaign_id",
-                    campaign_id,
-                )
-                .maybe_single()
-                .execute()
-            )
-
-            existing_strategy = strategy_response.data
-
-            prospects.append({
-                "prospect": prospect,
-                "icp_match": match,
-                "research": research,
-                "existing_strategy": existing_strategy,
-            })
 
         return {
             "campaign": campaign,
             "prospects": prospects,
         }
+
+    def _index_by_prospect(
+        self,
+        table: str,
+        campaign_id: str,
+        prospect_ids: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch a per-prospect table in one query instead of N."""
+
+        if not prospect_ids:
+            return {}
+
+        response = (
+            supabase
+            .table(table)
+            .select("*")
+            .eq("campaign_id", campaign_id)
+            .in_("prospect_id", prospect_ids)
+            .execute()
+        )
+
+        return {
+            row["prospect_id"]: row
+            for row in (response.data or [])
+        }
+
+    # ========================================================
+    # ELIGIBILITY
+    # ========================================================
 
     def _get_eligible_prospects(
         self,
@@ -246,7 +252,6 @@ class StrategyAgent:
         for item in context["prospects"]:
             match = item["icp_match"]
             prospect = item["prospect"]
-            research = item["research"]
 
             if match.get("decision") != "qualified":
                 continue
@@ -254,38 +259,26 @@ class StrategyAgent:
             if match.get("status") != "completed":
                 continue
 
-            confidence = float(
-                match.get("confidence") or 0
-            )
+            score = float(match.get("match_score") or 0)
+            confidence = float(match.get("confidence") or 0)
 
-            score = float(
-                match.get("match_score") or 0
-            )
-
-            if score < 70:
+            if score < STRATEGY_MIN_MATCH_SCORE:
                 continue
 
-            if confidence < 50:
+            if confidence < STRATEGY_MIN_CONFIDENCE:
                 continue
 
             if not prospect.get("full_name"):
                 continue
 
-            existing = item.get(
-                "existing_strategy"
-            )
+            existing = item.get("existing_strategy")
 
-            if existing and existing.get(
-                "should_contact"
-            ) is False:
+            if existing and existing.get("should_contact") is False:
                 continue
 
-            item["priority_score"] = (
-                score * 0.7
-                + confidence * 0.3
-            )
+            item["priority_score"] = score * 0.7 + confidence * 0.3
 
-            if research:
+            if item.get("research"):
                 item["priority_score"] += 5
 
             eligible.append(item)
@@ -297,27 +290,32 @@ class StrategyAgent:
 
         return eligible
 
-    def _calculate_usage(
-        self,
-        context: dict[str, Any],
-    ) -> dict[str, Any]:
+    # ========================================================
+    # CAPACITY
+    # ========================================================
+
+    def _calculate_usage(self, context: dict[str, Any]) -> dict[str, Any]:
 
         campaign = context["campaign"]
 
-        daily_limit = int(
-            campaign.get("daily_limits") or 50
-        )
+        try:
+            daily_limit = int(campaign.get("daily_limits") or 50)
+        except (TypeError, ValueError):
+            daily_limit = 50
+
+        # Limits are *daily*, so only today's events count against them.
+        since = (
+            datetime.now(timezone.utc) - timedelta(days=1)
+        ).isoformat()
 
         events_response = (
             supabase
             .table("outreach_events")
             .select(
-                "id, prospect_id, channel, event_type, status, created_at, payload"
+                "id, prospect_id, channel, event_type, status, created_at"
             )
-            .eq(
-                "campaign_id",
-                campaign["id"],
-            )
+            .eq("campaign_id", campaign["id"])
+            .gte("created_at", since)
             .execute()
         )
 
@@ -326,23 +324,15 @@ class StrategyAgent:
         contact_events = [
             event
             for event in events
-            if event.get("event_type") in {
-                "message_sent",
-                "outreach_sent",
-                "email_sent",
-                "linkedin_sent",
-                "voice_call",
-            }
+            if event.get("event_type") in CONTACT_EVENT_TYPES
         ]
 
-        channel_usage = {}
+        channel_usage: dict[str, int] = {}
 
         for event in contact_events:
             channel = event.get("channel") or "unknown"
 
-            channel_usage[channel] = (
-                channel_usage.get(channel, 0) + 1
-            )
+            channel_usage[channel] = channel_usage.get(channel, 0) + 1
 
         return {
             "daily_limit": daily_limit,
@@ -367,31 +357,31 @@ class StrategyAgent:
         if remaining <= 0:
             return 0
 
-        campaign = context["campaign"]
-
-        configured_target = (
-            campaign
-            .get("channel_configuration", {})
-            .get("daily_target")
+        channel_configuration = (
+            context["campaign"].get("channel_configuration") or {}
         )
 
-        if configured_target is None:
-            configured_target = self.default_daily_target
+        configured_target = channel_configuration.get("daily_target")
 
-        configured_target = int(
-            configured_target
+        try:
+            configured_target = int(
+                configured_target
+                if configured_target is not None
+                else DEFAULT_DAILY_TARGET
+            )
+        except (TypeError, ValueError):
+            configured_target = DEFAULT_DAILY_TARGET
+
+        configured_target = min(configured_target, MAX_DAILY_TARGET)
+
+        return max(
+            0,
+            min(configured_target, remaining, len(prospects)),
         )
 
-        configured_target = min(
-            configured_target,
-            self.max_daily_target,
-        )
-
-        return min(
-            configured_target,
-            remaining,
-            len(prospects),
-        )
+    # ========================================================
+    # RAG
+    # ========================================================
 
     async def _retrieve_rag(
         self,
@@ -403,93 +393,62 @@ class StrategyAgent:
 
         query = {
             "objective": campaign.get("objective"),
-            "target_personas": campaign.get(
-                "target_personas",
-                [],
-            ),
-            "geography": campaign.get(
-                "geography",
-                [],
-            ),
+            "target_personas": campaign.get("target_personas") or [],
+            "geography": campaign.get("geography") or [],
             "qualification_criteria": campaign.get(
-                "qualification_criteria",
-                [],
-            ),
-            "outreach_strategy": campaign.get(
-                "outreach_strategy"
-            ),
+                "qualification_criteria"
+            )
+            or [],
+            "outreach_strategy": campaign.get("outreach_strategy"),
             "prospects": [
                 {
-                    "name": item["prospect"].get(
-                        "full_name"
-                    ),
-                    "title": item["prospect"].get(
-                        "current_title"
-                    ),
-                    "score": item["icp_match"].get(
-                        "match_score"
-                    ),
-                    "research": item.get(
-                        "research"
-                    ),
+                    "name": item["prospect"].get("full_name"),
+                    "title": item["prospect"].get("current_title"),
+                    "score": item["icp_match"].get("match_score"),
                 }
                 for item in prospects
             ],
         }
 
-        embedding_query = json.dumps(
-            query,
-            default=str,
-        )
-
         return await retrieve_knowledge(
             campaign_id=campaign["id"],
-            query=embedding_query,
-            top_k=8,
-            min_similarity=0.35,
+            query=json.dumps(query, default=str),
         )
 
-    async def _generate_strategy(
+    # ========================================================
+    # PROMPT
+    # ========================================================
+
+    def _build_prompt(
         self,
         context: dict[str, Any],
         prospects: list[dict],
         usage: dict[str, Any],
         rag_context: str,
-    ) -> dict:
+    ) -> str:
 
-        campaign = context["campaign"]
+        campaign_json = json.dumps(
+            context["campaign"], indent=2, default=str
+        )
+        usage_json = json.dumps(usage, indent=2, default=str)
+        prospects_json = json.dumps(prospects, indent=2, default=str)
 
-        prompt = f"""
+        return f"""
 You are the Strategy Agent for a B2B autonomous SDR.
 
-Determine the safest and most effective outreach strategy for the supplied qualified prospects.
+Determine the safest and most effective outreach strategy for the
+supplied qualified prospects, using the campaign rules and evidence.
 
-Use the supplied campaign rules and evidence.
+You must respect the hard limits provided by the application, which has
+already calculated the maximum available daily capacity.
 
-You must respect the hard limits provided by the application.
-
-The application has already calculated the maximum available daily capacity.
-
-Your job is to determine:
-
-- whether outreach should continue
-- how many prospects should be targeted
-- priority of prospects
-- primary channel
-- secondary channel
-- objective
-- sequence step
-- delay
-- reason
-- constraints
+Decide: whether outreach should continue, how many prospects to target,
+their priority, the primary and secondary channels, the objective, the
+sequence step, the delay, the reason, and any constraints.
 
 Do not invent prospect facts.
-
 Do not exceed the supplied remaining capacity.
-
 Do not target prospects that are not qualified.
-
-Do not recommend contacting prospects when the campaign should stop.
 
 Return JSON only:
 
@@ -512,56 +471,33 @@ Return JSON only:
     ]
 }}
 
+campaign_status must be either "active" or "stopped".
+primary_channel and secondary_channel must be one of
+email, linkedin, sms, voice (or null for secondary_channel).
+
 campaign:
 
-{json.dumps(campaign, indent=2, default=str)}
+{campaign_json}
 
 usage:
 
-{json.dumps(usage, indent=2, default=str)}
+{usage_json}
 
 eligible prospects:
 
-{json.dumps(prospects, indent=2, default=str)}
+{prospects_json}
 
 retrieved campaign knowledge:
 
 {rag_context}
 """
 
-        response = await self.client.aio.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
-        )
-
-        if not response.text:
-            raise RuntimeError(
-                "Gemini returned an empty strategy response"
-            )
-
-        result = json.loads(response.text)
-
-        if not isinstance(result, dict):
-            raise RuntimeError(
-                "Invalid strategy response"
-            )
-
-        if result.get("campaign_status") not in {
-            "active",
-            "stopped",
-        }:
-            raise RuntimeError(
-                "Invalid campaign status"
-            )
-
-        return result
+    # ========================================================
+    # HARD LIMITS
+    # ========================================================
 
     def _apply_hard_limits(
         self,
-        context: dict[str, Any],
         prospects: list[dict],
         usage: dict[str, Any],
         gemini_strategy: dict,
@@ -578,59 +514,29 @@ retrieved campaign knowledge:
                 "prospects": [],
             }
 
-        allowed_ids = {
-            item["prospect"]["id"]
-            for item in prospects
-        }
-
-        raw_prospects = (
-            gemini_strategy.get("prospects")
-            or []
-        )
+        allowed_ids = {item["prospect"]["id"] for item in prospects}
 
         final_prospects = []
 
-        for strategy in raw_prospects:
+        for strategy in gemini_strategy.get("prospects") or []:
 
-            prospect_id = strategy.get(
-                "prospect_id"
-            )
-
-            if prospect_id not in allowed_ids:
+            if not isinstance(strategy, dict):
                 continue
 
-            if not strategy.get(
-                "should_contact",
-                False,
-            ):
+            if strategy.get("prospect_id") not in allowed_ids:
+                continue
+
+            if not strategy.get("should_contact", False):
                 continue
 
             if len(final_prospects) >= remaining:
                 break
 
-            if strategy.get(
-                "sequence_step",
-                1,
-            ) < 1:
-                strategy["sequence_step"] = 1
+            final_prospects.append(self._sanitize(strategy))
 
-            final_prospects.append(strategy)
+        daily_target = min(len(final_prospects), remaining)
 
-        daily_target = min(
-            len(final_prospects),
-            remaining,
-        )
-
-        campaign_status = (
-            "active"
-            if daily_target > 0
-            else "stopped"
-        )
-
-        reason = gemini_strategy.get(
-            "reason",
-            "",
-        )
+        reason = gemini_strategy.get("reason") or ""
 
         if not final_prospects:
             reason = (
@@ -639,14 +545,51 @@ retrieved campaign knowledge:
             )
 
         return {
-            "campaign_status": campaign_status,
+            "campaign_status": "active" if daily_target else "stopped",
             "reason": reason,
             "daily_target": daily_target,
             "remaining_capacity": remaining,
             "prospects": final_prospects,
         }
 
-    async def _store_strategies(
+    def _sanitize(self, strategy: dict[str, Any]) -> dict[str, Any]:
+
+        def channel(key: str) -> str | None:
+            value = strategy.get(key)
+
+            return value if value in VALID_CHANNELS else None
+
+        try:
+            sequence_step = max(1, int(strategy.get("sequence_step") or 1))
+        except (TypeError, ValueError):
+            sequence_step = 1
+
+        try:
+            delay_hours = max(0, int(strategy.get("delay_hours") or 0))
+        except (TypeError, ValueError):
+            delay_hours = 0
+
+        constraints = strategy.get("constraints")
+
+        return {
+            "prospect_id": strategy["prospect_id"],
+            "should_contact": True,
+            "primary_channel": channel("primary_channel") or "email",
+            "secondary_channel": channel("secondary_channel"),
+            "objective": strategy.get("objective"),
+            "sequence_step": sequence_step,
+            "delay_hours": delay_hours,
+            "strategy_reason": strategy.get("strategy_reason"),
+            "constraints": (
+                constraints if isinstance(constraints, dict) else {}
+            ),
+        }
+
+    # ========================================================
+    # PERSISTENCE
+    # ========================================================
+
+    def _store_strategies(
         self,
         campaign_id: str,
         strategies: list[dict],
@@ -655,64 +598,21 @@ retrieved campaign knowledge:
         if not strategies:
             return []
 
-        rows = []
-
-        for strategy in strategies:
-
-            rows.append({
-                "prospect_id": strategy[
-                    "prospect_id"
-                ],
-                "campaign_id": campaign_id,
-                "should_contact": strategy.get(
-                    "should_contact",
-                    True,
-                ),
-                "primary_channel": strategy.get(
-                    "primary_channel"
-                ),
-                "secondary_channel": strategy.get(
-                    "secondary_channel"
-                ),
-                "objective": strategy.get(
-                    "objective"
-                ),
-                "sequence_step": strategy.get(
-                    "sequence_step",
-                    1,
-                ),
-                "delay_hours": strategy.get(
-                    "delay_hours",
-                    0,
-                ),
-                "strategy_reason": strategy.get(
-                    "strategy_reason"
-                ),
-                "constraints": strategy.get(
-                    "constraints",
-                    {},
-                ),
-            })
+        rows = [
+            {**strategy, "campaign_id": campaign_id}
+            for strategy in strategies
+        ]
 
         response = (
             supabase
             .table("outreach_strategies")
-            .upsert(
-                rows,
-                on_conflict="prospect_id,campaign_id",
-            )
+            .upsert(rows, on_conflict="prospect_id,campaign_id")
             .execute()
         )
 
         return response.data or []
 
 
-async def generate_strategy(
-    campaign_id: str,
-) -> dict[str, Any]:
+async def generate_strategy(campaign_id: str) -> dict[str, Any]:
 
-    agent = StrategyAgent()
-
-    return await agent.run(
-        campaign_id=campaign_id,
-    )
+    return await StrategyAgent().run(campaign_id=campaign_id)

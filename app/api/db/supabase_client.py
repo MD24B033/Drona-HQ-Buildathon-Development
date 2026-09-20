@@ -1,28 +1,20 @@
-import os
+"""Service-role Supabase client.
 
-from dotenv import load_dotenv
+The backend is the only place that talks to the database. It uses the
+service-role key and therefore bypasses RLS, so every router is
+responsible for scoping queries to the caller's profile.
+"""
+
 from supabase import Client, create_client
 
-
-load_dotenv()
-
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-
-SUPABASE_SERVICE_ROLE_KEY = os.getenv(
-    "SUPABASE_KEY"
-)
+from core.config import SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 
 
 if not SUPABASE_URL:
-    raise RuntimeError(
-        "SUPABASE_URL is not configured"
-    )
+    raise RuntimeError("SUPABASE_URL is not configured")
 
 if not SUPABASE_SERVICE_ROLE_KEY:
-    raise RuntimeError(
-        "SUPABASE_SERVICE_ROLE_KEY is not configured"
-    )
+    raise RuntimeError("SUPABASE_KEY is not configured")
 
 
 supabase: Client = create_client(
