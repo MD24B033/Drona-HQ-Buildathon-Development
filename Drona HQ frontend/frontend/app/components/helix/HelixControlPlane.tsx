@@ -184,11 +184,42 @@ export default function HelixControlPlane() {
     },
   ]);
 
+  // Modal & Toast States
+  const [toast, setToast] = useState<{
+    message: string;
+    type: "success" | "error" | "info";
+  } | null>(null);
+
+  const showToast = (
+    message: string,
+    type: "success" | "error" | "info" = "success"
+  ) => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 3500);
+  };
+
+  const [showNewCampaignModal, setShowNewCampaignModal] = useState(false);
+  const [newCampaignName, setNewCampaignName] = useState("");
+  const [newCampaignIcp, setNewCampaignIcp] = useState("");
+  const [newCampaignRegion, setNewCampaignRegion] = useState("United States");
+
+  const [showCompareModal, setShowCompareModal] = useState(false);
+  const [showProfileMenu, setShowProfileMenu] = useState(false);
+
+  // Inline edit for approval draft
+  const [isEditingDraft, setIsEditingDraft] = useState(false);
+  const [draftEditText, setDraftEditText] = useState("");
+
+  // Inbox reply state
+  const [showInboxReplyModal, setShowInboxReplyModal] = useState(false);
+  const [selectedInboxMsg, setSelectedInboxMsg] = useState<any>(null);
+  const [replyText, setReplyText] = useState("");
+
   // Approvals state
   const [approvalTab, setApprovalTab] = useState("needs_approval");
   const [selectedApprovalId, setSelectedApprovalId] = useState("elena-vasquez");
 
-  const approvals = [
+  const [approvals, setApprovals] = useState([
     {
       id: "elena-vasquez",
       name: "Elena Vasquez",
@@ -268,7 +299,7 @@ export default function HelixControlPlane() {
       promptVersion: "prompt v7",
       agentStage: "followup",
     },
-  ];
+  ]);
 
   // Prospects state
   const [prospectFilter, setProspectFilter] = useState("all");
@@ -466,6 +497,68 @@ GUARDRAILS
     setIsPlatformKilled(true);
     setCampaigns((prev) => prev.map((c) => ({ ...c, status: "paused" })));
     setShowKillSwitchModal(false);
+    showToast("Global Kill Switch activated: All autonomous actions halted", "error");
+  };
+
+  const handleApprove = (id: string) => {
+    setIsEditingDraft(false);
+    setApprovals((prev) => prev.filter((a) => a.id !== id));
+    showToast("✓ Approved and sent to prospect via omnichannel outreach!", "success");
+    const remaining = approvals.filter((a) => a.id !== id);
+    if (remaining.length > 0) {
+      setSelectedApprovalId(remaining[0].id);
+    }
+  };
+
+  const handleReject = (id: string) => {
+    setIsEditingDraft(false);
+    setApprovals((prev) => prev.filter((a) => a.id !== id));
+    showToast("✕ Draft rejected and returned to Agent reasoning loop.", "error");
+    const remaining = approvals.filter((a) => a.id !== id);
+    if (remaining.length > 0) {
+      setSelectedApprovalId(remaining[0].id);
+    }
+  };
+
+  const handleStartEdit = () => {
+    if (selectedApproval) {
+      setDraftEditText(selectedApproval.draftMessage);
+      setIsEditingDraft(true);
+    }
+  };
+
+  const handleSaveEdit = () => {
+    setApprovals((prev) =>
+      prev.map((a) =>
+        a.id === selectedApprovalId ? { ...a, draftMessage: draftEditText } : a
+      )
+    );
+    setIsEditingDraft(false);
+    showToast("Draft updated successfully!", "info");
+  };
+
+  const handleCreateNewCampaign = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newCampaignName.trim()) return;
+
+    const newCamp = {
+      id: `camp-${Date.now()}`,
+      name: newCampaignName,
+      tags: [newCampaignIcp || "Custom ICP", "Active", newCampaignRegion],
+      status: "live",
+      prospects: 50,
+      outreach: 0,
+      meetings: 0,
+      owner: "Priya Raman",
+      ownerInitials: "PR",
+      color: "#00d2aa",
+    };
+
+    setCampaigns((prev) => [newCamp, ...prev]);
+    setShowNewCampaignModal(false);
+    setNewCampaignName("");
+    setNewCampaignIcp("");
+    showToast(`Campaign "${newCampaignName}" created and launched!`, "success");
   };
 
   const selectedApproval =
@@ -676,92 +769,150 @@ GUARDRAILS
             </button>
 
             {showNotifications && (
-              <div className="absolute right-0 top-full mt-2 w-80 sm:w-96 bg-[#0b101e] border border-gray-800 rounded-xl shadow-2xl z-50 overflow-hidden animate-in fade-in slide-in-from-top-2 duration-150">
-                <div className="p-3.5 border-b border-gray-800 flex items-center justify-between bg-gray-900/50">
-                  <div className="flex items-center gap-2">
-                    <span className="font-semibold text-white text-xs">
-                      Notifications
-                    </span>
-                    {unreadNotificationsCount > 0 && (
-                      <span className="bg-amber-500/10 text-amber-400 border border-amber-500/30 text-[10px] px-1.5 py-0.5 rounded font-bold">
-                        {unreadNotificationsCount} new
+              <>
+                <div
+                  className="fixed inset-0 z-40"
+                  onClick={() => setShowNotifications(false)}
+                />
+                <div className="absolute right-0 top-full mt-2 w-80 sm:w-96 bg-[#0b101e] border border-gray-800 rounded-xl shadow-2xl z-50 overflow-hidden animate-in fade-in slide-in-from-top-2 duration-150">
+                  <div className="p-3.5 border-b border-gray-800 flex items-center justify-between bg-gray-900/50">
+                    <div className="flex items-center gap-2">
+                      <span className="font-semibold text-white text-xs">
+                        Notifications
                       </span>
+                      {unreadNotificationsCount > 0 && (
+                        <span className="bg-amber-500/10 text-amber-400 border border-amber-500/30 text-[10px] px-1.5 py-0.5 rounded font-bold">
+                          {unreadNotificationsCount} new
+                        </span>
+                      )}
+                    </div>
+                    {unreadNotificationsCount > 0 && (
+                      <button
+                        onClick={() =>
+                          setNotifications((prev) =>
+                            prev.map((n) => ({ ...n, read: true }))
+                          )
+                        }
+                        className="text-[11px] text-[#00d2aa] hover:underline font-medium"
+                      >
+                        Mark all read
+                      </button>
                     )}
                   </div>
-                  {unreadNotificationsCount > 0 && (
-                    <button
-                      onClick={() =>
-                        setNotifications((prev) =>
-                          prev.map((n) => ({ ...n, read: true }))
-                        )
-                      }
-                      className="text-[11px] text-[#00d2aa] hover:underline font-medium"
-                    >
-                      Mark all read
-                    </button>
-                  )}
-                </div>
 
-                <div className="divide-y divide-gray-800/60 max-h-80 overflow-y-auto">
-                  {notifications.map((n) => (
-                    <div
-                      key={n.id}
-                      onClick={() => {
-                        setActiveTab(n.tab);
-                        if (n.approvalId) setSelectedApprovalId(n.approvalId);
-                        setNotifications((prev) =>
-                          prev.map((item) =>
-                            item.id === n.id ? { ...item, read: true } : item
-                          )
-                        );
-                        setShowNotifications(false);
-                      }}
-                      className={`p-3.5 hover:bg-gray-800/40 transition cursor-pointer flex items-start gap-3 ${
-                        !n.read ? "bg-[#0f172a]/60" : ""
-                      }`}
-                    >
-                      <div className="mt-0.5 shrink-0">
-                        {n.priority === "high" ? (
-                          <AlertTriangle size={14} className="text-amber-400" />
-                        ) : n.priority === "medium" ? (
-                          <ShieldCheck size={14} className="text-blue-400" />
-                        ) : (
-                          <CheckCircle2 size={14} className="text-emerald-400" />
-                        )}
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between gap-2">
-                          <span
-                            className={`text-xs font-semibold truncate ${
-                              !n.read ? "text-white" : "text-gray-300"
-                            }`}
-                          >
-                            {n.title}
-                          </span>
-                          <span className="text-[10px] text-gray-500 shrink-0">
-                            {n.time}
-                          </span>
+                  <div className="divide-y divide-gray-800/60 max-h-80 overflow-y-auto">
+                    {notifications.map((n) => (
+                      <div
+                        key={n.id}
+                        onClick={() => {
+                          setActiveTab(n.tab);
+                          if (n.approvalId) setSelectedApprovalId(n.approvalId);
+                          setNotifications((prev) =>
+                            prev.map((item) =>
+                              item.id === n.id ? { ...item, read: true } : item
+                            )
+                          );
+                          setShowNotifications(false);
+                        }}
+                        className={`p-3.5 hover:bg-gray-800/40 transition cursor-pointer flex items-start gap-3 ${
+                          !n.read ? "bg-[#0f172a]/60" : ""
+                        }`}
+                      >
+                        <div className="mt-0.5 shrink-0">
+                          {n.priority === "high" ? (
+                            <AlertTriangle size={14} className="text-amber-400" />
+                          ) : n.priority === "medium" ? (
+                            <ShieldCheck size={14} className="text-blue-400" />
+                          ) : (
+                            <CheckCircle2 size={14} className="text-emerald-400" />
+                          )}
                         </div>
-                        <p className="text-[11px] text-gray-400 mt-1 leading-snug">
-                          {n.message}
-                        </p>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between gap-2">
+                            <span
+                              className={`text-xs font-semibold truncate ${
+                                !n.read ? "text-white" : "text-gray-300"
+                              }`}
+                            >
+                              {n.title}
+                            </span>
+                            <span className="text-[10px] text-gray-500 shrink-0">
+                              {n.time}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-gray-400 mt-1 leading-snug">
+                            {n.message}
+                          </p>
+                        </div>
                       </div>
-                    </div>
-                  ))}
-                </div>
+                    ))}
+                  </div>
 
-                <div className="p-2.5 border-t border-gray-800 text-center bg-gray-900/30">
-                  <span className="text-[10px] text-gray-500">
-                    Click any alert to navigate directly to that view
-                  </span>
+                  <div className="p-2.5 border-t border-gray-800 text-center bg-gray-900/30">
+                    <span className="text-[10px] text-gray-500">
+                      Click any alert to navigate directly to that view
+                    </span>
+                  </div>
                 </div>
-              </div>
+              </>
             )}
           </div>
 
           {/* User Profile */}
-          <div className="w-7 h-7 rounded-full bg-emerald-700 border border-emerald-500/40 text-emerald-100 flex items-center justify-center text-xs font-bold">
-            PR
+          <div className="relative">
+            <button
+              onClick={() => setShowProfileMenu(!showProfileMenu)}
+              className="w-7 h-7 rounded-full bg-emerald-700 border border-emerald-500/40 text-emerald-100 flex items-center justify-center text-xs font-bold hover:ring-2 hover:ring-[#00d2aa] transition cursor-pointer"
+            >
+              PR
+            </button>
+
+            {showProfileMenu && (
+              <>
+                <div
+                  className="fixed inset-0 z-40"
+                  onClick={() => setShowProfileMenu(false)}
+                />
+                <div className="absolute right-0 top-full mt-2 w-64 bg-[#0b101e] border border-gray-800 rounded-xl shadow-2xl z-50 p-4 space-y-3 animate-in fade-in slide-in-from-top-2 duration-150">
+                  <div className="flex items-center gap-3 border-b border-gray-800 pb-3">
+                    <div className="w-9 h-9 rounded-full bg-emerald-700 border border-emerald-500/40 text-emerald-100 flex items-center justify-center text-sm font-bold">
+                      PR
+                    </div>
+                    <div>
+                      <div className="font-semibold text-white text-xs">Priya Raman</div>
+                      <div className="text-[11px] text-gray-400">Lead SDR Admin</div>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5 text-xs text-gray-300">
+                    <div className="flex items-center justify-between py-1">
+                      <span className="text-gray-400">Workspace:</span>
+                      <span className="font-medium text-white">Meridian Enterprise</span>
+                    </div>
+                    <div className="flex items-center justify-between py-1">
+                      <span className="text-gray-400">Active Reps:</span>
+                      <span className="font-medium text-white">3 Assigned</span>
+                    </div>
+                    <div className="flex items-center justify-between py-1">
+                      <span className="text-gray-400">Platform:</span>
+                      <span className="text-[#00d2aa] font-mono text-[11px]">DronaHQ SDR v1.0</span>
+                    </div>
+                  </div>
+
+                  <div className="pt-2 border-t border-gray-800">
+                    <button
+                      onClick={() => {
+                        setShowProfileMenu(false);
+                        showToast("Signed out session. Demo mode active.", "info");
+                      }}
+                      className="w-full text-center py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-xs text-red-400 font-medium transition"
+                    >
+                      Sign out
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         </div>
       </header>
@@ -782,11 +933,17 @@ GUARDRAILS
               </div>
 
               <div className="flex items-center gap-3">
-                <button className="px-3.5 py-1.5 rounded-lg border border-gray-700 bg-gray-800/80 hover:bg-gray-800 text-xs font-medium text-gray-300 transition flex items-center gap-1.5">
+                <button
+                  onClick={() => setShowCompareModal(true)}
+                  className="px-3.5 py-1.5 rounded-lg border border-gray-700 bg-gray-800/80 hover:bg-gray-800 text-xs font-medium text-gray-300 transition flex items-center gap-1.5"
+                >
                   <SlidersHorizontal size={13} />
                   Compare
                 </button>
-                <button className="px-3.5 py-1.5 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-semibold transition flex items-center gap-1.5 shadow-lg shadow-[#00d2aa]/20">
+                <button
+                  onClick={() => setShowNewCampaignModal(true)}
+                  className="px-3.5 py-1.5 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-semibold transition flex items-center gap-1.5 shadow-lg shadow-[#00d2aa]/20"
+                >
                   <Plus size={14} />
                   New campaign
                 </button>
@@ -852,11 +1009,22 @@ GUARDRAILS
             <div className="flex items-center justify-between pt-2">
               <div className="flex items-center gap-2">
                 {[
-                  { label: "All", count: 3, value: "all" },
-                  { label: "Live", count: 1, value: "live" },
-                  { label: "Paused", count: 1, value: "paused" },
-                  { label: "Draft", count: 1, value: "draft" },
-                  { label: "Completed", count: 0, value: "completed" },
+                  { label: "All", count: campaigns.length, value: "all" },
+                  {
+                    label: "Live",
+                    count: campaigns.filter((c) => c.status === "live").length,
+                    value: "live",
+                  },
+                  {
+                    label: "Paused",
+                    count: campaigns.filter((c) => c.status === "paused").length,
+                    value: "paused",
+                  },
+                  {
+                    label: "Draft",
+                    count: campaigns.filter((c) => c.status === "draft").length,
+                    value: "draft",
+                  },
                 ].map((pill) => (
                   <button
                     key={pill.value}
@@ -904,13 +1072,29 @@ GUARDRAILS
                 </thead>
                 <tbody className="divide-y divide-gray-800/60">
                   {campaigns
-                    .filter(
-                      (c) =>
-                        campaignFilter === "all" || c.status === campaignFilter
-                    )
+                    .filter((c) => {
+                      const matchesStatus =
+                        campaignFilter === "all" || c.status === campaignFilter;
+                      const matchesSearch =
+                        !searchQuery.trim() ||
+                        c.name
+                          .toLowerCase()
+                          .includes(searchQuery.toLowerCase()) ||
+                        c.tags.some((t) =>
+                          t.toLowerCase().includes(searchQuery.toLowerCase())
+                        );
+                      return matchesStatus && matchesSearch;
+                    })
                     .map((camp) => (
                       <tr
                         key={camp.id}
+                        onClick={() => {
+                          setActiveTab("runs");
+                          showToast(
+                            `Viewing live agent telemetry for ${camp.name}`,
+                            "info"
+                          );
+                        }}
                         className="hover:bg-gray-800/30 transition group cursor-pointer"
                       >
                         <td className="py-4 px-4 relative">
@@ -1080,126 +1264,196 @@ GUARDRAILS
               ))}
             </div>
 
-            {/* Split Screen Master-Detail */}
-            <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
-              <div className="md:col-span-5 space-y-3">
-                {approvals.map((item) => (
-                  <div
-                    key={item.id}
-                    onClick={() => setSelectedApprovalId(item.id)}
-                    className={`p-4 rounded-xl border transition cursor-pointer relative ${
-                      selectedApprovalId === item.id
-                        ? "bg-[#0f172a] border-[#00d2aa]/40 shadow-lg"
-                        : "bg-[#0b101e] border-gray-800/80 hover:border-gray-700"
-                    }`}
+            {/* Split Screen Master-Detail or Empty State */}
+            {approvals.length === 0 ? (
+              <div className="bg-[#0b101e] border border-gray-800/80 rounded-2xl p-16 text-center shadow-xl space-y-4">
+                <div className="w-14 h-14 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 mx-auto flex items-center justify-center">
+                  <CheckCircle2 size={28} />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-white tracking-tight">
+                    All caught up! No pending approvals
+                  </h3>
+                  <p className="text-xs text-gray-400 mt-1.5 max-w-md mx-auto leading-relaxed">
+                    Every message has been reviewed. Autonomous SDR agents are
+                    actively nurturing prospects within platform guardrails.
+                  </p>
+                </div>
+                <div className="pt-2">
+                  <button
+                    onClick={() => setActiveTab("campaigns")}
+                    className="px-4 py-2 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-bold transition shadow-lg shadow-[#00d2aa]/20 inline-flex items-center gap-2"
                   >
-                    {selectedApprovalId === item.id && (
-                      <div className="absolute left-0 top-3 bottom-3 w-1 bg-[#00d2aa] rounded-r" />
-                    )}
-
-                    <div className="flex items-center justify-between mb-1.5">
-                      <span className="font-semibold text-white text-sm">
-                        {item.name}
-                      </span>
-                      <span className="text-gray-500 text-[11px] flex items-center gap-1">
-                        <Clock size={11} /> {item.time}
-                      </span>
-                    </div>
-
-                    <div className="text-xs text-gray-300 font-medium line-clamp-1 mb-2">
-                      {item.subject}
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      <span className="bg-amber-500/10 border border-amber-500/30 text-amber-400 text-[10px] px-2 py-0.5 rounded font-semibold">
-                        Needs approval
-                      </span>
-                      <span className="bg-gray-800 text-gray-400 text-[10px] px-2 py-0.5 rounded border border-gray-700">
-                        {item.type}
-                      </span>
-                      <span className="text-gray-500 text-[11px] truncate">
-                        {item.campaign}
-                      </span>
-                    </div>
-                  </div>
-                ))}
+                    View Active Campaigns
+                    <ArrowRight size={14} />
+                  </button>
+                </div>
               </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
+                <div className="md:col-span-5 space-y-3">
+                  {approvals.map((item) => (
+                    <div
+                      key={item.id}
+                      onClick={() => {
+                        setSelectedApprovalId(item.id);
+                        setIsEditingDraft(false);
+                      }}
+                      className={`p-4 rounded-xl border transition cursor-pointer relative ${
+                        selectedApprovalId === item.id
+                          ? "bg-[#0f172a] border-[#00d2aa]/40 shadow-lg"
+                          : "bg-[#0b101e] border-gray-800/80 hover:border-gray-700"
+                      }`}
+                    >
+                      {selectedApprovalId === item.id && (
+                        <div className="absolute left-0 top-3 bottom-3 w-1 bg-[#00d2aa] rounded-r" />
+                      )}
 
-              <div className="md:col-span-7 bg-[#0b101e] border border-gray-800/80 rounded-xl p-6 shadow-xl space-y-6">
-                <div className="flex items-start justify-between border-b border-gray-800 pb-4">
-                  <div>
-                    <div className="flex items-center gap-2 mb-1.5">
-                      <span className="bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs px-2.5 py-0.5 rounded font-semibold">
-                        Needs approval
-                      </span>
-                      <h2 className="text-base font-bold text-white">
-                        {selectedApproval.subject}
-                      </h2>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className="font-semibold text-white text-sm">
+                          {item.name}
+                        </span>
+                        <span className="text-gray-500 text-[11px] flex items-center gap-1">
+                          <Clock size={11} /> {item.time}
+                        </span>
+                      </div>
+
+                      <div className="text-xs text-gray-300 font-medium line-clamp-1 mb-2">
+                        {item.subject}
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <span className="bg-amber-500/10 border border-amber-500/30 text-amber-400 text-[10px] px-2 py-0.5 rounded font-semibold">
+                          Needs approval
+                        </span>
+                        <span className="bg-gray-800 text-gray-400 text-[10px] px-2 py-0.5 rounded border border-gray-700">
+                          {item.type}
+                        </span>
+                        <span className="text-gray-500 text-[11px] truncate">
+                          {item.campaign}
+                        </span>
+                      </div>
                     </div>
-                    <div className="text-xs text-gray-400">
-                      {selectedApproval.name} • {selectedApproval.campaign} •{" "}
-                      {selectedApproval.time}
+                  ))}
+                </div>
+
+                {selectedApproval && (
+                  <div className="md:col-span-7 bg-[#0b101e] border border-gray-800/80 rounded-xl p-6 shadow-xl space-y-6">
+                    <div className="flex items-start justify-between border-b border-gray-800 pb-4">
+                      <div>
+                        <div className="flex items-center gap-2 mb-1.5">
+                          <span className="bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs px-2.5 py-0.5 rounded font-semibold">
+                            Needs approval
+                          </span>
+                          <h2 className="text-base font-bold text-white">
+                            {selectedApproval.subject}
+                          </h2>
+                        </div>
+                        <div className="text-xs text-gray-400">
+                          {selectedApproval.name} • {selectedApproval.campaign} •{" "}
+                          {selectedApproval.time}
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <span className="bg-gray-800 text-gray-300 text-xs px-2.5 py-1 rounded border border-gray-700">
+                          {selectedApproval.agentStage}
+                        </span>
+                        <span className="bg-gray-800 text-gray-400 text-xs px-2.5 py-1 rounded border border-gray-700">
+                          {selectedApproval.promptVersion}
+                        </span>
+                      </div>
                     </div>
-                  </div>
 
-                  <div className="flex items-center gap-2">
-                    <span className="bg-gray-800 text-gray-300 text-xs px-2.5 py-1 rounded border border-gray-700">
-                      {selectedApproval.agentStage}
-                    </span>
-                    <span className="bg-gray-800 text-gray-400 text-xs px-2.5 py-1 rounded border border-gray-700">
-                      {selectedApproval.promptVersion}
-                    </span>
-                  </div>
-                </div>
+                    <div>
+                      <div className="text-xs font-semibold text-gray-400 mb-2">
+                        Why a human is needed
+                      </div>
+                      <div className="bg-[#070b14] border border-gray-800 rounded-lg p-3 text-xs font-mono text-amber-300/90">
+                        {selectedApproval.rule}
+                      </div>
+                    </div>
 
-                <div>
-                  <div className="text-xs font-semibold text-gray-400 mb-2">
-                    Why a human is needed
-                  </div>
-                  <div className="bg-[#070b14] border border-gray-800 rounded-lg p-3 text-xs font-mono text-amber-300/90">
-                    {selectedApproval.rule}
-                  </div>
-                </div>
+                    <div>
+                      <div className="flex items-center justify-between text-xs font-semibold text-gray-400 mb-2">
+                        <span>Message the agent wants to send</span>
+                        {isEditingDraft && (
+                          <span className="text-[#00d2aa] text-[11px] font-medium">
+                            Editing draft...
+                          </span>
+                        )}
+                      </div>
+                      {isEditingDraft ? (
+                        <div className="space-y-2">
+                          <textarea
+                            rows={5}
+                            value={draftEditText}
+                            onChange={(e) => setDraftEditText(e.target.value)}
+                            className="w-full bg-[#070b14] border border-[#00d2aa]/60 rounded-lg p-3 text-xs text-white leading-relaxed focus:outline-none focus:ring-1 focus:ring-[#00d2aa] font-sans resize-none"
+                          />
+                          <div className="flex justify-end gap-2">
+                            <button
+                              onClick={() => setIsEditingDraft(false)}
+                              className="px-3 py-1 rounded text-xs text-gray-400 hover:text-white"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              onClick={handleSaveEdit}
+                              className="px-3 py-1 rounded bg-[#00d2aa] text-gray-950 text-xs font-bold hover:bg-[#00be99]"
+                            >
+                              Apply Changes
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="bg-[#070b14] border border-gray-800 rounded-lg p-4 text-xs text-gray-200 leading-relaxed whitespace-pre-wrap">
+                          {selectedApproval.draftMessage}
+                        </div>
+                      )}
+                    </div>
 
-                <div>
-                  <div className="text-xs font-semibold text-gray-400 mb-2">
-                    Message the agent wants to send
-                  </div>
-                  <div className="bg-[#070b14] border border-gray-800 rounded-lg p-4 text-xs text-gray-200 leading-relaxed whitespace-pre-wrap">
-                    {selectedApproval.draftMessage}
-                  </div>
-                </div>
+                    <div>
+                      <div className="text-xs font-semibold text-gray-400 mb-2.5">
+                        Guardrails passed
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {selectedApproval.guardrails.map((g, i) => (
+                          <span
+                            key={i}
+                            className="inline-flex items-center gap-1.5 bg-emerald-950/40 border border-emerald-500/30 text-emerald-400 text-[11px] px-2.5 py-1 rounded-md font-medium"
+                          >
+                            <CheckCircle2 size={12} className="text-emerald-400" />
+                            {g}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
 
-                <div>
-                  <div className="text-xs font-semibold text-gray-400 mb-2.5">
-                    Guardrails passed
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    {selectedApproval.guardrails.map((g, i) => (
-                      <span
-                        key={i}
-                        className="inline-flex items-center gap-1.5 bg-emerald-950/40 border border-emerald-500/30 text-emerald-400 text-[11px] px-2.5 py-1 rounded-md font-medium"
+                    <div className="flex items-center justify-end gap-3 pt-4 border-t border-gray-800">
+                      <button
+                        onClick={() => handleReject(selectedApproval.id)}
+                        className="px-4 py-2 rounded-lg border border-red-500/30 bg-red-500/10 hover:bg-red-500/20 text-red-400 text-xs font-medium transition"
                       >
-                        <CheckCircle2 size={12} className="text-emerald-400" />
-                        {g}
-                      </span>
-                    ))}
+                        Reject
+                      </button>
+                      <button
+                        onClick={isEditingDraft ? handleSaveEdit : handleStartEdit}
+                        className="px-4 py-2 rounded-lg border border-gray-700 bg-gray-800/80 hover:bg-gray-800 text-xs font-medium text-gray-300 transition"
+                      >
+                        {isEditingDraft ? "Save Edit" : "Edit"}
+                      </button>
+                      <button
+                        onClick={() => handleApprove(selectedApproval.id)}
+                        className="px-4 py-2 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-bold transition shadow-lg shadow-[#00d2aa]/20"
+                      >
+                        Approve and send
+                      </button>
+                    </div>
                   </div>
-                </div>
-
-                <div className="flex items-center justify-end gap-3 pt-4 border-t border-gray-800">
-                  <button className="px-4 py-2 rounded-lg border border-gray-700 bg-gray-800/80 hover:bg-gray-800 text-xs font-medium text-gray-300 transition">
-                    Reject
-                  </button>
-                  <button className="px-4 py-2 rounded-lg border border-gray-700 bg-gray-800/80 hover:bg-gray-800 text-xs font-medium text-gray-300 transition">
-                    Edit
-                  </button>
-                  <button className="px-4 py-2 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-bold transition shadow-lg shadow-[#00d2aa]/20">
-                    Approve and send
-                  </button>
-                </div>
+                )}
               </div>
-            </div>
+            )}
           </div>
         )}
 
@@ -1217,7 +1471,15 @@ GUARDRAILS
                 </p>
               </div>
 
-              <button className="px-3.5 py-1.5 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-bold transition flex items-center gap-1.5 shadow-lg shadow-[#00d2aa]/20">
+              <button
+                onClick={() =>
+                  showToast(
+                    "Imported 24 verified prospects from Apollo CSV!",
+                    "success"
+                  )
+                }
+                className="px-3.5 py-1.5 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-bold transition flex items-center gap-1.5 shadow-lg shadow-[#00d2aa]/20"
+              >
                 <Plus size={14} />
                 Import prospects
               </button>
@@ -1360,7 +1622,10 @@ GUARDRAILS
                   </option>
                 </select>
 
-                <button className="px-3 py-1.5 rounded-lg border border-gray-700 bg-gray-800/80 hover:bg-gray-800 text-xs font-medium text-gray-300 transition flex items-center gap-1">
+                <button
+                  onClick={() => setActiveTab("campaigns")}
+                  className="px-3 py-1.5 rounded-lg border border-gray-700 bg-gray-800/80 hover:bg-gray-800 text-xs font-medium text-gray-300 transition flex items-center gap-1"
+                >
                   Open campaign <ArrowRight size={12} />
                 </button>
               </div>
@@ -1394,7 +1659,15 @@ GUARDRAILS
                   <span className="text-[11px] text-gray-500">
                     Changes create an incremental version automatically.
                   </span>
-                  <button className="px-4 py-1.5 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-bold transition shadow-lg shadow-[#00d2aa]/20">
+                  <button
+                    onClick={() =>
+                      showToast(
+                        "Prompt v8 saved successfully! Incremental version deployed.",
+                        "success"
+                      )
+                    }
+                    className="px-4 py-1.5 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-bold transition shadow-lg shadow-[#00d2aa]/20"
+                  >
                     Save as v8
                   </button>
                 </div>
@@ -1431,7 +1704,15 @@ GUARDRAILS
                             in use
                           </span>
                         ) : (
-                          <button className="text-[10px] text-gray-400 hover:text-white px-2 py-0.5 rounded bg-gray-800 border border-gray-700">
+                          <button
+                            onClick={() =>
+                              showToast(
+                                `Harness rolled back to ${v.version}. System prompt updated.`,
+                                "info"
+                              )
+                            }
+                            className="text-[10px] text-gray-400 hover:text-white px-2 py-0.5 rounded bg-gray-800 border border-gray-700"
+                          >
                             Roll back
                           </button>
                         )}
@@ -1466,7 +1747,15 @@ GUARDRAILS
                 </p>
               </div>
 
-              <button className="px-3.5 py-1.5 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-bold transition flex items-center gap-1.5 shadow-lg shadow-[#00d2aa]/20">
+              <button
+                onClick={() =>
+                  showToast(
+                    "Uploaded PDF parsed and 32 chunks indexed into Supabase pgvector.",
+                    "success"
+                  )
+                }
+                className="px-3.5 py-1.5 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-bold transition flex items-center gap-1.5 shadow-lg shadow-[#00d2aa]/20"
+              >
                 <Plus size={14} />
                 Add document
               </button>
@@ -1940,6 +2229,20 @@ GUARDRAILS
                   );
                 })}
               </div>
+
+              <div className="pt-3 border-t border-gray-800 flex justify-end">
+                <button
+                  onClick={() =>
+                    showToast(
+                      "Platform guardrails saved and synced to active SDR agent runtime.",
+                      "success"
+                    )
+                  }
+                  className="px-4 py-1.5 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-bold transition shadow-lg shadow-[#00d2aa]/20"
+                >
+                  Save Guardrails
+                </button>
+              </div>
             </div>
 
             {/* Models Available Section */}
@@ -2012,7 +2315,16 @@ GUARDRAILS
               ].map((msg) => (
                 <div
                   key={msg.id}
-                  className="p-4 hover:bg-gray-800/30 transition flex items-center justify-between cursor-pointer"
+                  onClick={() => {
+                    setSelectedInboxMsg(msg);
+                    setShowInboxReplyModal(true);
+                    setReplyText(
+                      msg.id === "1"
+                        ? "Both fair questions. We are SOC 2 Type II, and us-east-1 residency is supported on the standard plan — I have attached the one-pager your security team usually asks for.\n\nIf it helps, I can hold two slots this week: Tue 2:00 PM CT or Thu 10:30 AM CT."
+                        : "Great hearing back Jonas! We have several benchmarks and case studies on real-time database sync across AWS and GCP regions. Would a 15-minute technical walkthrough with our lead architect work for you this Thursday?"
+                    );
+                  }}
+                  className="p-4 hover:bg-gray-800/40 transition flex items-center justify-between cursor-pointer group"
                 >
                   <div className="flex items-center gap-4">
                     <div className="w-9 h-9 rounded-full bg-indigo-950 border border-indigo-500/30 text-indigo-300 flex items-center justify-center text-xs font-bold">
@@ -2020,7 +2332,7 @@ GUARDRAILS
                     </div>
                     <div>
                       <div className="flex items-center gap-2">
-                        <span className="font-semibold text-white text-xs">
+                        <span className="font-semibold text-white text-xs group-hover:text-[#00d2aa] transition">
                           {msg.name}
                         </span>
                         <span className="text-[11px] text-gray-500">
@@ -2103,6 +2415,281 @@ GUARDRAILS
               >
                 Stop everything
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ================= TOAST NOTIFICATION ================= */}
+      {toast && (
+        <div className="fixed bottom-6 right-6 z-50 animate-in fade-in slide-in-from-bottom-3 duration-200">
+          <div
+            className={`px-4 py-3 rounded-xl shadow-2xl border flex items-center gap-2.5 text-xs font-medium ${
+              toast.type === "success"
+                ? "bg-emerald-950/90 text-emerald-200 border-emerald-500/50"
+                : toast.type === "error"
+                ? "bg-red-950/90 text-red-200 border-red-500/50"
+                : "bg-gray-900 text-gray-200 border-gray-700"
+            }`}
+          >
+            {toast.type === "success" ? (
+              <CheckCircle2 size={16} className="text-emerald-400 shrink-0" />
+            ) : toast.type === "error" ? (
+              <AlertTriangle size={16} className="text-red-400 shrink-0" />
+            ) : (
+              <Sparkles size={16} className="text-[#00d2aa] shrink-0" />
+            )}
+            <span>{toast.message}</span>
+          </div>
+        </div>
+      )}
+
+      {/* ================= NEW CAMPAIGN MODAL ================= */}
+      {showNewCampaignModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+          <div className="bg-[#0b101e] border border-gray-800 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4 animate-in fade-in zoom-in duration-150">
+            <div className="flex items-center justify-between border-b border-gray-800 pb-3">
+              <div className="flex items-center gap-2">
+                <div className="w-7 h-7 rounded-lg bg-[#00d2aa]/20 border border-[#00d2aa]/40 flex items-center justify-center text-[#00d2aa]">
+                  <Plus size={16} />
+                </div>
+                <h3 className="text-sm font-bold text-white">Create New GTM Campaign</h3>
+              </div>
+              <button
+                onClick={() => setShowNewCampaignModal(false)}
+                className="text-gray-400 hover:text-white"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateNewCampaign} className="space-y-3.5">
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1">
+                  Campaign Name
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. European Fintech CFO Outreach"
+                  value={newCampaignName}
+                  onChange={(e) => setNewCampaignName(e.target.value)}
+                  className="w-full bg-[#070b14] border border-gray-800 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-[#00d2aa]"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1">
+                  Target ICP Persona
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. Chief Financial Officer, Series B+"
+                  value={newCampaignIcp}
+                  onChange={(e) => setNewCampaignIcp(e.target.value)}
+                  className="w-full bg-[#070b14] border border-gray-800 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-[#00d2aa]"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1">
+                  Geography
+                </label>
+                <select
+                  value={newCampaignRegion}
+                  onChange={(e) => setNewCampaignRegion(e.target.value)}
+                  className="w-full bg-[#070b14] border border-gray-800 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-[#00d2aa]"
+                >
+                  <option value="United States">United States</option>
+                  <option value="India">India</option>
+                  <option value="Europe">Europe</option>
+                  <option value="Global">Global</option>
+                </select>
+              </div>
+
+              <div className="pt-2 flex items-center justify-end gap-2.5 border-t border-gray-800">
+                <button
+                  type="button"
+                  onClick={() => setShowNewCampaignModal(false)}
+                  className="px-3.5 py-1.5 rounded-lg border border-gray-700 text-xs font-medium text-gray-300 hover:bg-gray-800"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-1.5 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-bold transition shadow-lg shadow-[#00d2aa]/20"
+                >
+                  Launch Campaign
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ================= COMPARE CAMPAIGNS MODAL ================= */}
+      {showCompareModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+          <div className="bg-[#0b101e] border border-gray-800 rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-4 animate-in fade-in zoom-in duration-150">
+            <div className="flex items-center justify-between border-b border-gray-800 pb-3">
+              <div className="flex items-center gap-2">
+                <SlidersHorizontal size={16} className="text-[#00d2aa]" />
+                <h3 className="text-sm font-bold text-white">Compare Campaign Performance</h3>
+              </div>
+              <button
+                onClick={() => setShowCompareModal(false)}
+                className="text-gray-400 hover:text-white"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div className="p-4 bg-[#070b14] border border-gray-800 rounded-xl space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-xs text-white">US SaaS CTO outreach</span>
+                  <span className="text-[10px] text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">Live</span>
+                </div>
+                <div className="space-y-1.5 text-xs">
+                  <div className="flex justify-between text-gray-400">Prospects: <span className="text-white font-medium">1,284</span></div>
+                  <div className="flex justify-between text-gray-400">Outreach Sent: <span className="text-white font-medium">426</span></div>
+                  <div className="flex justify-between text-gray-400">Meetings Booked: <span className="text-emerald-400 font-bold">18 (4.2%)</span></div>
+                  <div className="flex justify-between text-gray-400">Cost per Qualified Lead: <span className="text-white font-mono">$0.42</span></div>
+                  <div className="flex justify-between text-gray-400">Agent Efficiency: <span className="text-[#00d2aa] font-medium">94.2%</span></div>
+                </div>
+              </div>
+
+              <div className="p-4 bg-[#070b14] border border-gray-800 rounded-xl space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-xs text-white">India BFSI CIO</span>
+                  <span className="text-[10px] text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">Paused</span>
+                </div>
+                <div className="space-y-1.5 text-xs">
+                  <div className="flex justify-between text-gray-400">Prospects: <span className="text-white font-medium">642</span></div>
+                  <div className="flex justify-between text-gray-400">Outreach Sent: <span className="text-white font-medium">211</span></div>
+                  <div className="flex justify-between text-gray-400">Meetings Booked: <span className="text-emerald-400 font-bold">11 (5.2%)</span></div>
+                  <div className="flex justify-between text-gray-400">Cost per Qualified Lead: <span className="text-white font-mono">$0.38</span></div>
+                  <div className="flex justify-between text-gray-400">Agent Efficiency: <span className="text-[#00d2aa] font-medium">91.8%</span></div>
+                </div>
+              </div>
+            </div>
+
+            <div className="pt-2 flex justify-end border-t border-gray-800">
+              <button
+                onClick={() => setShowCompareModal(false)}
+                className="px-4 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-xs font-medium text-white transition"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ================= INBOX CONVERSATION MODAL ================= */}
+      {showInboxReplyModal && selectedInboxMsg && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+          <div className="bg-[#0b101e] border border-gray-800 rounded-2xl max-w-xl w-full p-6 shadow-2xl space-y-4 animate-in fade-in zoom-in duration-150">
+            <div className="flex items-center justify-between border-b border-gray-800 pb-3">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-full bg-indigo-950 border border-indigo-500/30 text-indigo-300 flex items-center justify-center text-xs font-bold">
+                  {selectedInboxMsg.name.slice(0, 2).toUpperCase()}
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    {selectedInboxMsg.name}
+                    <span className="text-[10px] text-gray-400 bg-gray-800 px-2 py-0.5 rounded border border-gray-700 uppercase font-mono">
+                      {selectedInboxMsg.channel}
+                    </span>
+                  </h3>
+                  <div className="text-[11px] text-gray-400">
+                    {selectedInboxMsg.company} • Inbound {selectedInboxMsg.time}
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowInboxReplyModal(false)}
+                className="text-gray-400 hover:text-white"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            {/* Inbound Prospect Message Bubble */}
+            <div>
+              <div className="text-[11px] font-semibold text-gray-400 mb-1">
+                Inbound Message
+              </div>
+              <div className="bg-[#070b14] border border-gray-800 rounded-lg p-3.5 text-xs text-gray-200 leading-relaxed">
+                "{selectedInboxMsg.snippet}"
+              </div>
+            </div>
+
+            {/* AI Agent Reasoning */}
+            <div className="p-3 bg-[#0f172a]/60 border border-indigo-500/20 rounded-lg space-y-1">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-indigo-400">
+                <Sparkles size={13} />
+                <span>Autonomous Agent Analysis</span>
+              </div>
+              <p className="text-[11px] text-gray-300">
+                Intent: High buyer intent, inquiry. Grounded against Meridian Knowledge base RAG embeddings.
+              </p>
+            </div>
+
+            {/* Reply Editor */}
+            <div>
+              <div className="text-[11px] font-semibold text-gray-400 mb-1">
+                Draft Response
+              </div>
+              <textarea
+                rows={4}
+                value={replyText}
+                onChange={(e) => setReplyText(e.target.value)}
+                className="w-full bg-[#070b14] border border-gray-800 rounded-lg p-3 text-xs text-white leading-relaxed focus:outline-none focus:border-[#00d2aa] font-sans resize-none"
+              />
+            </div>
+
+            {/* Footer Buttons */}
+            <div className="pt-2 flex items-center justify-between border-t border-gray-800">
+              {selectedInboxMsg.id === "1" ? (
+                <button
+                  onClick={() => {
+                    setShowInboxReplyModal(false);
+                    setActiveTab("approvals");
+                    setSelectedApprovalId("elena-vasquez");
+                  }}
+                  className="px-3 py-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 text-xs font-medium transition flex items-center gap-1.5"
+                >
+                  <CheckSquare size={13} />
+                  Open in Approvals Queue
+                </button>
+              ) : (
+                <div />
+              )}
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowInboxReplyModal(false)}
+                  className="px-3.5 py-1.5 rounded-lg border border-gray-700 text-xs font-medium text-gray-300 hover:bg-gray-800"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowInboxReplyModal(false);
+                    showToast(
+                      `Reply dispatched to ${selectedInboxMsg.name} via ${selectedInboxMsg.channel}!`,
+                      "success"
+                    );
+                  }}
+                  className="px-4 py-1.5 rounded-lg bg-[#00d2aa] hover:bg-[#00be99] text-gray-950 text-xs font-bold transition shadow-lg shadow-[#00d2aa]/20 flex items-center gap-1.5"
+                >
+                  <Send size={13} />
+                  Send Reply
+                </button>
+              </div>
             </div>
           </div>
         </div>
