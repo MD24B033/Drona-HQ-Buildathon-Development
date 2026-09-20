@@ -33,14 +33,24 @@ PROJECT_NAME = "Drona HQ Sales Automation API"
 
 VERSION = "1.0.0"
 
+# Exact origins allowed by CORS. In production set FRONTEND_URL to the
+# Vercel production domain, e.g. https://drona-hq.vercel.app
 FRONTEND_URLS = [
-    url.strip()
+    url.strip().rstrip("/")
     for url in os.getenv(
         "FRONTEND_URL",
         "http://localhost:3000,http://127.0.0.1:3000",
     ).split(",")
     if url.strip()
 ]
+
+# Vercel gives every preview deployment its own generated hostname, so
+# those cannot be listed one by one. Set FRONTEND_URL_REGEX to allow
+# them, e.g. https://.*-my-team\.vercel\.app
+#
+# Credentials are allowed on these requests, so keep the pattern tight:
+# never use a bare .* that would match any origin.
+FRONTEND_URL_REGEX = os.getenv("FRONTEND_URL_REGEX", "").strip() or None
 
 
 # ============================================================

@@ -1,14 +1,23 @@
 """Drona HQ sales automation API.
 
-Run from this directory:
+Imports are relative to this directory, so run it from here:
 
+    cd app/api
     uvicorn main:app --reload --port 8000
+
+In production (Railway) the same is done by railway.json, which binds
+to 0.0.0.0 on the platform-supplied $PORT.
 """
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from core.config import FRONTEND_URLS, PROJECT_NAME, VERSION
+from core.config import (
+    FRONTEND_URL_REGEX,
+    FRONTEND_URLS,
+    PROJECT_NAME,
+    VERSION,
+)
 from routers import agents, campaigns, companies, conversations, knowledge
 from routers import profile as profile_router
 
@@ -26,6 +35,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_URLS,
+    allow_origin_regex=FRONTEND_URL_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

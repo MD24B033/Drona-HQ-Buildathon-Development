@@ -87,6 +87,91 @@ Open <http://localhost:3000>.
    contacts anyone, and it is off by default.
 6. **Prospects**, **Conversations** and **Activity** show what happened.
 
+## Deploying
+
+Frontend on Vercel, backend on Railway, both from this one repository.
+
+### 1. Push
+
+```bash
+git add -A && git commit -m "Wire up frontend and backend" && git push
+```
+
+### 2. Backend on Railway
+
+1. **New Project → Deploy from GitHub repo**, pick this repo.
+2. Leave **Root Directory** empty. `railway.json` at the repo root does
+   the rest: Nixpacks installs from `requirements.txt`, then starts
+   `uvicorn` from `app/api` bound to `0.0.0.0:$PORT`. Python is pinned
+   by `.python-version`.
+3. Add **Variables**:
+
+   | Variable | Value |
+   | --- | --- |
+   | `SUPABASE_URL` | your Supabase project URL |
+   | `SUPABASE_KEY` | the **service role** key, not the anon key |
+   | `GEMINI_API_KEY` | your Gemini key |
+   | `GEMINI_MODEL` | `gemini-3.5-flash` |
+   | `GEMINI_FALLBACK_MODEL` | `gemini-3.5-flash-lite` |
+   | `FRONTEND_URL` | your Vercel production URL (added in step 4) |
+   | `CHANNEL_SIMULATION` | `true` until you wire up a real provider |
+
+4. **Settings → Networking → Generate Domain**. Copy the
+   `https://….up.railway.app` URL.
+5. Check `https://<your-api>/health` returns
+   `{"status":"healthy","database":"connected"}`. Railway uses this
+   same path as its healthcheck.
+
+### 3. Frontend on Vercel
+
+1. **Add New → Project**, import the same repo.
+2. Set **Root Directory** to `Drona HQ frontend/frontend`. This is the
+   one setting that matters — Vercel autodetects Next.js from there.
+3. Add **Environment Variables** (all three, for every environment):
+
+   | Variable | Value |
+   | --- | --- |
+   | `NEXT_PUBLIC_SUPABASE_URL` | your Supabase project URL |
+   | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | the **anon** key |
+   | `NEXT_PUBLIC_API_URL` | the Railway URL, no trailing slash |
+
+   These are inlined at build time, so a missing one **fails the build**
+   with a message naming the variable rather than deploying something
+   broken.
+4. Deploy, then copy the production URL.
+
+### 4. Connect the two
+
+1. Back in Railway, set `FRONTEND_URL` to the Vercel production URL
+   (e.g. `https://drona-hq.vercel.app`) and redeploy.
+2. To let Vercel **preview** deployments reach the API too, also set
+   `FRONTEND_URL_REGEX` to a pattern matching them, e.g.
+   `https://drona-hq-.*\.vercel\.app`. Keep it specific — credentials
+   are allowed on these requests, so a broad `.*` would open the API to
+   any origin.
+3. In **Supabase → Authentication → URL Configuration**:
+   - **Site URL** → your Vercel production URL (used by confirmation
+     emails).
+   - **Redirect URLs** → add `https://<your-app>.vercel.app/auth/callback`,
+     plus `http://localhost:3000/auth/callback` for local work, and a
+     preview wildcard if you use Google sign-in on previews.
+
+### Deployment notes
+
+- **Long agent runs.** Agent endpoints are synchronous and a single
+  agent takes roughly 15–70s; `POST /agents/pipeline/run` across many
+  prospects can run for minutes and may hit the platform's request
+  timeout. Run individual stages from the Agents tab rather than the
+  whole pipeline, or move the orchestrator onto a background worker
+  before running it at scale.
+- **Free-tier Gemini quota** is per day per model and is the first
+  thing you will hit — see *Model configuration* below.
+- **Cold starts.** The first request after an idle period pays the
+  container start plus a Supabase round trip.
+- **Secrets.** `app/api/.env` and `.env.local` are gitignored; the
+  committed `.env.example` files hold placeholders only. The service
+  role key belongs only in Railway, never in a `NEXT_PUBLIC_*` variable.
+
 ## Outreach delivery
 
 `core/channels.py` is the only place that sends anything. No provider
