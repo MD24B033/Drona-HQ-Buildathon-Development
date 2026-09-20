@@ -11,11 +11,15 @@ from google.genai import types
 from core.config import FALLBACK_MODEL, GEMINI_API_KEY
 
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not configured")
+client = None
+if GEMINI_API_KEY and GEMINI_API_KEY != "your-gemini-api-key":
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as exc:
+        print(f"[GEMINI] Warning: Could not initialize Gemini client: {exc}")
+else:
+    print("[GEMINI] Warning: GEMINI_API_KEY is not configured. Agents requiring LLM will prompt for configuration.")
 
-
-client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 PERMANENT_ERROR_MARKERS = (

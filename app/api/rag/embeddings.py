@@ -10,11 +10,13 @@ from core.config import (
 )
 
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not configured")
+client = None
+if GEMINI_API_KEY and GEMINI_API_KEY != "your-gemini-api-key":
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception:
+        pass
 
-
-client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 async def create_embedding(

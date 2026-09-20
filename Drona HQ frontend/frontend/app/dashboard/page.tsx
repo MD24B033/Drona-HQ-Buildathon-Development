@@ -1,7 +1,7 @@
 "use client";
 
-import DashboardPage from "../components/dashboard/dashboard";
+import HelixControlPlane from "../components/helix/HelixControlPlane";
 
 export default function Dashboard() {
-  return <DashboardPage />;
+  return <HelixControlPlane />;
 }
